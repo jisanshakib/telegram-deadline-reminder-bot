@@ -19,13 +19,16 @@ DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_RETRIES = 3
 
+# Non-retryable HTTP status codes from Gemini API (fail fast so admin is alerted immediately)
+_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
+
 _SYSTEM_INSTRUCTION_TEMPLATE = """You extract event deadlines from Telegram channel posts.
 Rules:
-1. Analyze the post carefully and determine whether it mentions an event, campaign, contest, giveaway, airdrop, registration, sale, scholarship, or task that has a deadline or end date.
+1. Analyze the post carefully and determine whether it mentions an event, campaign, contest, giveaway, airdrop, registration, sale, scholarship, submission, or task that has a deadline or end date.
 2. Set `has_deadline` to true ONLY if an explicit or clearly calculable end date / deadline exists in the post.
 3. Infer a concise, clear `title` capturing the main event or topic (no hashtags, emojis, or trailing punctuation; max ~80 characters).
-4. Normalize `start_date` and `end_date` to strict ISO format `YYYY-MM-DD`, using the provided current date ({timezone_name}) to resolve relative expressions (e.g. "ends in 5 days", "until this Friday", "ends May 20").
-5. If a month and day are given without a year, infer the most reasonable upcoming year relative to the provided current date unless context clearly indicates a past year.
+4. Normalize `start_date` and `end_date` to strict ISO format `YYYY-MM-DD`, using the provided current date ({timezone_name}) to resolve relative expressions (e.g. "ends in 5 days", "ends tomorrow", "until this Friday", "ends May 20").
+5. If a month and day are given without a year, ALWAYS anchor the year to the provided current date (choosing the current year or next year if that month/day already passed) — never fall back to an older year.
 6. If `start_date` or `end_date` is not present or cannot be reliably determined, return null for that field.
 7. Never invent dates that are not supported by the post text."""
 
@@ -57,7 +60,6 @@ def _normalize_iso_date(value: Optional[str]) -> Optional[str]:
     cleaned = value.strip()
     if cleaned.lower() in {"null", "none", "n/a", ""}:
         return None
-    # Match YYYY-MM-DD or YYYY-M-D with optional trailing timestamp (e.g. T23:59:59Z)
     match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s].*)?$", cleaned)
     if not match:
         return None
@@ -108,7 +110,6 @@ def _parse_response_payload(response: object) -> Optional[DeadlineExtraction]:
         try:
             return DeadlineExtraction.model_validate_json(cleaned)
         except ValidationError:
-            # Attempt direct JSON object extraction as fallback
             try:
                 data = json.loads(cleaned)
                 if isinstance(data, dict):
@@ -117,6 +118,18 @@ def _parse_response_payload(response: object) -> Optional[DeadlineExtraction]:
                 logger.warning("Failed to parse Gemini JSON text output: %.200s", cleaned)
 
     return None
+
+
+def _is_non_retryable_error(exc: BaseException) -> bool:
+    """Detect client/configuration errors (400/401/403/404) that should fail fast."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int) and code in _NON_RETRYABLE_STATUS_CODES:
+        return True
+    msg = str(exc).upper()
+    return any(
+        marker in msg
+        for marker in ("404 NOT_FOUND", "403 PERMISSION_DENIED", "401 UNAUTHENTICATED", "API_KEY_INVALID")
+    )
 
 
 class GeminiDeadlineParser:
@@ -154,10 +167,9 @@ class GeminiDeadlineParser:
                 end_date=None,
             )
 
-        # Cap overly huge payloads while keeping full context of typical Telegram posts (<=4096 chars)
         prompt = (
             f"Current Date ({self.timezone_name}): {current_date.isoformat()} "
-            f"({current_date.strftime('%A, %d %B %Y')})\n\n"
+            f"({current_date.strftime('%A, %d %B %Y')}, Year={current_date.year})\n\n"
             f"Telegram Channel Post:\n{trimmed_text[:6000]}"
         )
 
@@ -183,40 +195,43 @@ class GeminiDeadlineParser:
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt < self.max_retries:
-                    backoff = min(2.0 ** (attempt - 1), 6.0)
-                    logger.warning(
-                        "Gemini API attempt %d/%d failed (%s); retrying in %.1fs",
+                if _is_non_retryable_error(exc) or attempt >= self.max_retries:
+                    logger.exception(
+                        "Gemini API failed (model=%s, attempt=%d/%d): %s",
+                        self.model,
                         attempt,
                         self.max_retries,
                         exc,
-                        backoff,
                     )
-                    await asyncio.sleep(backoff)
-                else:
-                    logger.exception(
-                        "Gemini API failed after %d attempts while parsing channel post",
-                        self.max_retries,
-                    )
+                    break
+                backoff = min(2.0 ** (attempt - 1), 6.0)
+                logger.warning(
+                    "Gemini API attempt %d/%d failed (model=%s, err=%s); retrying in %.1fs",
+                    attempt,
+                    self.max_retries,
+                    self.model,
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
 
         if last_error is not None:
-            raise last_error
+            raise RuntimeError(
+                f"Gemini model '{self.model}' error: {type(last_error).__name__}: {last_error}"
+            ) from last_error
 
         raw_parsed = _parse_response_payload(response)
         if raw_parsed is None:
-            logger.warning("Gemini returned an empty or unparseable structured response")
-            return DeadlineExtraction(
-                has_deadline=False,
-                title=None,
-                start_date=None,
-                end_date=None,
+            raw_preview = str(getattr(response, "text", "") or "")[:200]
+            raise ValueError(
+                f"Gemini model '{self.model}' returned an empty or unparseable JSON response"
+                + (f": {raw_preview}" if raw_preview else "")
             )
 
         start_date = _normalize_iso_date(raw_parsed.start_date)
         end_date = _normalize_iso_date(raw_parsed.end_date)
         title = _clean_title(raw_parsed.title)
 
-        # Guard against inverted dates (e.g. model misinterpreting a year rollover)
         if start_date and end_date and date.fromisoformat(start_date) > date.fromisoformat(end_date):
             logger.warning(
                 "Gemini extracted start_date (%s) > end_date (%s); clearing invalid start_date",

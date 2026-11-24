@@ -506,6 +506,38 @@ class Database:
                 )
         return row is not None
 
+    async def has_any_reminder_for_post(
+        self,
+        channel_id: str | int,
+        message_id: int,
+        *,
+        post_link: Optional[str] = None,
+    ) -> bool:
+        """Return True if ANY reminder (pending/active/declined/expired) exists for this post."""
+        async with self.pool.acquire() as conn:
+            if post_link:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM reminders
+                    WHERE (channel_id = $1 AND message_id = $2) OR post_link = $3
+                    LIMIT 1
+                    """,
+                    str(channel_id).strip(),
+                    int(message_id),
+                    post_link.strip(),
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM reminders
+                    WHERE channel_id = $1 AND message_id = $2
+                    LIMIT 1
+                    """,
+                    str(channel_id).strip(),
+                    int(message_id),
+                )
+        return row is not None
+
     async def list_active_reminders(self) -> list[Reminder]:
         """Return all active reminders sorted by soonest end_date first."""
         async with self.pool.acquire() as conn:

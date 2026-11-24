@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Optional, Union
 
-from telegram import Chat, InlineKeyboardMarkup, Update
+from telegram import Chat, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
@@ -42,7 +42,7 @@ from keyboards import (
     build_repeat_mode_keyboard,
     build_window_selection_keyboard,
 )
-from scheduler import post_reminder_to_channel
+from scheduler import AdminNotifier, post_reminder_to_channel
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,11 @@ _PRIVATE_LINK_RE = re.compile(
 # Matches public links: https://t.me/channel_name/42 or https://t.me/s/channel_name/42
 _PUBLIC_LINK_RE = re.compile(
     r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})/(\d+)(?=[/?#\s]|$)",
+    re.IGNORECASE,
+)
+
+_CHANNEL_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/@?([A-Za-z][A-Za-z0-9_]{3,})/?$",
     re.IGNORECASE,
 )
 
@@ -139,9 +144,7 @@ def parse_user_date(raw_text: str) -> Optional[date]:
     cleaned = " ".join(raw_text.strip().split())
     if not cleaned:
         return None
-    # Strip English ordinal suffixes such as 1st, 2nd, 3rd, 31st
     cleaned = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", cleaned, flags=re.IGNORECASE)
-    # Normalize spaces around commas (e.g. "31 December , 2026" -> "31 December, 2026")
     cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
 
     for fmt in _ACCEPTED_DATE_FORMATS:
@@ -152,17 +155,59 @@ def parse_user_date(raw_text: str) -> Optional[date]:
     return None
 
 
-def _matches_channel(chat: Chat, configured_channel_id: Union[int, str]) -> bool:
-    """Check whether an incoming channel_post originates from the configured CHANNEL_ID."""
+def _normalize_username(raw: str) -> Optional[str]:
+    """Extract a bare lowercase Telegram username from @user, user, or https://t.me/user."""
+    cleaned = raw.strip().strip("\"'")
+    if not cleaned:
+        return None
+    url_match = _CHANNEL_URL_RE.match(cleaned)
+    if url_match:
+        return url_match.group(1).lower()
+    if cleaned.startswith("@"):
+        return cleaned[1:].strip().lower() or None
+    if not cleaned.lstrip("-").isdigit() and "/" not in cleaned:
+        return cleaned.lower()
+    return None
+
+
+def _matches_channel(
+    chat: Chat,
+    configured_channel_id: Union[int, str],
+    *,
+    resolved_channel_id: Optional[int] = None,
+    resolved_channel_username: Optional[str] = None,
+) -> bool:
+    """Robustly check whether an incoming channel post matches CHANNEL_ID.
+
+    Handles exact numeric IDs (`-100...`), bare internal numeric IDs (`1234567890`),
+    `@username`, bare `username`, `https://t.me/username`, and startup-resolved chat IDs.
+    """
+    if resolved_channel_id is not None and chat.id == resolved_channel_id:
+        return True
+
+    if resolved_channel_username and chat.username:
+        if chat.username.lower() == resolved_channel_username.lstrip("@").lower():
+            return True
+
     if isinstance(configured_channel_id, int):
-        return chat.id == configured_channel_id
+        if chat.id == configured_channel_id:
+            return True
+        chat_internal = extract_internal_channel_id(chat.id)
+        cfg_internal = extract_internal_channel_id(configured_channel_id)
+        return bool(chat_internal and cfg_internal and chat_internal == cfg_internal)
 
-    target = str(configured_channel_id).strip()
+    target = str(configured_channel_id).strip().strip("\"'")
     if target.lstrip("-").isdigit():
-        return chat.id == int(target)
+        target_int = int(target)
+        if chat.id == target_int:
+            return True
+        chat_internal = extract_internal_channel_id(chat.id)
+        cfg_internal = extract_internal_channel_id(target)
+        return bool(chat_internal and cfg_internal and chat_internal == cfg_internal)
 
-    if chat.username:
-        return chat.username.lower() == target.lstrip("@").lower()
+    target_username = _normalize_username(target)
+    if target_username and chat.username:
+        return chat.username.lower() == target_username
 
     return False
 
@@ -189,7 +234,59 @@ def _get_parser(context: ContextTypes.DEFAULT_TYPE) -> GeminiDeadlineParser:
 
 
 def _get_channel_id(context: ContextTypes.DEFAULT_TYPE) -> Union[int, str]:
+    resolved = context.bot_data.get("resolved_channel_id")
+    if resolved is not None:
+        return resolved
     return context.bot_data["channel_id"]
+
+
+def _get_notifier(context: ContextTypes.DEFAULT_TYPE) -> Optional[AdminNotifier]:
+    notifier = context.bot_data.get("notifier")
+    if isinstance(notifier, AdminNotifier):
+        return notifier
+    bot = getattr(context, "bot", None)
+    admin_id = context.bot_data.get("admin_user_id")
+    if bot is not None and isinstance(admin_id, int):
+        notifier = AdminNotifier(bot=bot, admin_user_id=admin_id)
+        context.bot_data["notifier"] = notifier
+        return notifier
+    return None
+
+
+async def _notify_admin_error(
+    context: ContextTypes.DEFAULT_TYPE,
+    operation: str,
+    error: Union[BaseException, str],
+    *,
+    context_info: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
+) -> None:
+    notifier = _get_notifier(context)
+    if notifier is not None:
+        await notifier.notify_error(
+            operation,
+            error,
+            context_info=context_info,
+            dedupe_key=dedupe_key,
+        )
+
+
+async def _notify_admin_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    title: str,
+    body: str,
+    *,
+    post_link: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
+) -> None:
+    notifier = _get_notifier(context)
+    if notifier is not None:
+        await notifier.notify_notice(
+            title,
+            body,
+            post_link=post_link,
+            dedupe_key=dedupe_key,
+        )
 
 
 def _parse_positive_int(raw: str) -> Optional[int]:
@@ -217,7 +314,6 @@ async def _safe_answer(
     try:
         await query.answer(text=safe_text, show_alert=show_alert)
     except BadRequest as exc:
-        # Ignore expired callback query timeouts cleanly
         logger.debug("Callback answer skipped: %s", exc)
 
 
@@ -283,7 +379,6 @@ def _escape_and_fit_post_details(post_text: str, budget_chars: int) -> str:
 
     suffix = "...\n[truncated]"
     max_body = max(100, budget_chars - len(suffix))
-    # Trim raw text iteratively so we never split an HTML entity like &amp;
     low, high = 0, len(cleaned)
     while low < high:
         mid = (low + high + 1) // 2
@@ -312,6 +407,21 @@ def _format_detection_message(reminder: Reminder, today: date) -> str:
     budget = min(2400, _TELEGRAM_MAX_MESSAGE_LEN - len(header) - len(footer) - 64)
     post_preview = _escape_and_fit_post_details(reminder.post_text, budget)
     return f"{header}{post_preview}{footer}"
+
+
+def _format_detection_plain_fallback(reminder: Reminder, today: date) -> str:
+    duration_text = _format_duration_text(reminder.start_date, reminder.end_date, today)
+    preview = reminder.post_text.strip()[:1200]
+    return (
+        "New Event Deadline Detected\n\n"
+        f"Title: {reminder.title}\n"
+        f"Start Date: {reminder.start_date or 'N/A'}\n"
+        f"End Date: {reminder.end_date}\n"
+        f"Total Duration: {duration_text}\n"
+        f"Original Post: {reminder.post_link}\n\n"
+        f"Post Details:\n{preview}\n\n"
+        "Would you like to activate automated reminders for this event?"
+    )
 
 
 def _format_overview_message(
@@ -360,7 +470,6 @@ def _format_active_list_message(reminders: list[Reminder], today: date) -> str:
             f"   ⏳ End: <code>{html.escape(rem.end_date)}</code> ({html.escape(_format_days_left_label(days_left))}) | "
             f"🪟 {html.escape(rem.window_label)} | 🔁 {html.escape(rem.repeat_mode_label)}"
         )
-        # Keep total message length well within Telegram's 4096-char ceiling
         projected_len = sum(len(l) + 1 for l in lines) + len(entry) + len(footer) + 120
         if projected_len > _TELEGRAM_MAX_MESSAGE_LEN:
             break
@@ -453,13 +562,19 @@ async def enforce_admin_access(
     """Strictly block all non-admin users and non-private admin interactions.
 
     Channel posts (`channel_post` / `edited_channel_post`) are allowed through to the
-    channel monitor, which separately verifies `CHANNEL_ID`. Every other update
+    channel monitor, which separately verifies `CHANNEL_ID`. Membership service updates
+    (`my_chat_member` / `chat_member`) are ignored silently. Every other update
     (commands, messages, button clicks, group chats) MUST originate from `ADMIN_USER_ID`
     inside a private chat; otherwise it is rejected immediately and halted via
     `ApplicationHandlerStop`.
     """
     if update.channel_post is not None or update.edited_channel_post is not None:
         return
+
+    if getattr(update, "my_chat_member", None) is not None or getattr(
+        update, "chat_member", None
+    ) is not None:
+        raise ApplicationHandlerStop
 
     if _is_private_admin(update, context):
         return
@@ -495,60 +610,152 @@ async def enforce_admin_access(
 # ======================================================================
 
 
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Monitor incoming channel posts, cache text, and detect event deadlines via Gemini."""
-    post = update.channel_post
-    if post is None:
+async def _process_channel_post(
+    post: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    is_edit: bool = False,
+) -> None:
+    """Core pipeline: verify channel -> cache -> Gemini parse -> save pending -> notify admin."""
+    configured_channel = context.bot_data["channel_id"]
+    resolved_channel_id = context.bot_data.get("resolved_channel_id")
+    resolved_channel_username = context.bot_data.get("resolved_channel_username")
+
+    logger.info(
+        "Received %s from chat_id=%s (username=%s, message_id=%d)",
+        "edited_channel_post" if is_edit else "channel_post",
+        post.chat.id,
+        post.chat.username,
+        post.message_id,
+    )
+
+    if not _matches_channel(
+        post.chat,
+        configured_channel,
+        resolved_channel_id=resolved_channel_id,
+        resolved_channel_username=resolved_channel_username,
+    ):
+        logger.warning(
+            "Channel post ignored due to CHANNEL_ID mismatch: incoming chat_id=%s (@%s), configured CHANNEL_ID=%s",
+            post.chat.id,
+            post.chat.username or "private",
+            configured_channel,
+        )
+        if not is_edit:
+            await _notify_admin_error(
+                context,
+                "Channel Post Detection",
+                (
+                    f"Received a post in chat {post.chat.id} "
+                    f"(@{post.chat.username or 'private'}), which does not match "
+                    f"configured CHANNEL_ID={configured_channel}. "
+                    f"Set CHANNEL_ID={post.chat.id} in your Railway Variables if this is your target channel."
+                ),
+                context_info=f"Message ID: {post.message_id}",
+                dedupe_key=f"channel_mismatch:{post.chat.id}",
+            )
         return
 
-    configured_channel = _get_channel_id(context)
-    if not _matches_channel(post.chat, configured_channel):
-        logger.debug(
-            "Ignoring channel_post from unconfigured chat %s (%s)",
-            post.chat.id,
-            post.chat.username,
-        )
-        return
+    # Learn resolved chat ID/username dynamically as well
+    context.bot_data["resolved_channel_id"] = post.chat.id
+    if post.chat.username:
+        context.bot_data["resolved_channel_username"] = post.chat.username.lower()
 
     post_text = (post.text or post.caption or "").strip()
     if not post_text:
+        logger.info("Channel post %s/%d has no text or caption; skipping", post.chat.id, post.message_id)
         return
 
     db = _get_db(context)
     post_link = build_post_link(post.chat, post.message_id)
 
-    # Always cache incoming channel posts for manual link lookup
-    await db.cache_channel_post(
-        channel_id=post.chat.id,
-        channel_username=post.chat.username,
-        message_id=post.message_id,
-        post_text=post_text,
-        post_link=post_link,
-    )
+    # 1. Cache incoming channel post in Supabase (never abort detection if cache fails)
+    try:
+        await db.cache_channel_post(
+            channel_id=post.chat.id,
+            channel_username=post.chat.username,
+            message_id=post.message_id,
+            post_text=post_text,
+            post_link=post_link,
+        )
+    except Exception as exc:
+        logger.exception("Failed to cache channel post %s/%d in Supabase", post.chat.id, post.message_id)
+        await _notify_admin_error(
+            context,
+            "Database Error",
+            exc,
+            context_info=f"Caching channel post {post_link}",
+            dedupe_key=f"cache_err:{post.message_id}",
+        )
 
-    # Avoid duplicate pending/active reminders for the same post
-    if await db.has_open_reminder_for_post(post.chat.id, post.message_id, post_link=post_link):
-        logger.debug("Post %s/%d already has an open reminder", post.chat.id, post.message_id)
+    # 2. Avoid duplicate reminders (for edits, skip if ANY reminder already exists for this post)
+    try:
+        if is_edit:
+            already_tracked = await db.has_any_reminder_for_post(
+                post.chat.id,
+                post.message_id,
+                post_link=post_link,
+            )
+        else:
+            already_tracked = await db.has_open_reminder_for_post(
+                post.chat.id,
+                post.message_id,
+                post_link=post_link,
+            )
+    except Exception as exc:
+        logger.exception("Failed checking existing reminder for %s/%d", post.chat.id, post.message_id)
+        await _notify_admin_error(
+            context,
+            "Database Error",
+            exc,
+            context_info=f"Checking existing reminders for {post_link}",
+            dedupe_key=f"dup_check_err:{post.message_id}",
+        )
         return
 
+    if already_tracked:
+        logger.debug("Post %s/%d already tracked; skipping detection", post.chat.id, post.message_id)
+        return
+
+    # 3. Extract deadline via Gemini API
     parser = _get_parser(context)
     today = db.today()
 
     try:
         extraction = await parser.extract_deadline(post_text=post_text, current_date=today)
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Gemini extraction failed for channel post %s/%d",
             post.chat.id,
             post.message_id,
         )
+        await _notify_admin_error(
+            context,
+            "Gemini Parsing",
+            exc,
+            context_info=f"Post: {post_link} | Model: {parser.model}",
+            dedupe_key=f"gemini_err:{post.message_id}",
+        )
         return
 
     if not (extraction.has_deadline and extraction.end_date):
         logger.info("No deadline detected in channel post %s/%d", post.chat.id, post.message_id)
+        title_hint = f"Detected topic: {extraction.title}\n" if extraction.title else ""
+        await _notify_admin_notice(
+            context,
+            "Channel Post Seen — No Deadline Detected",
+            (
+                "The bot received and cached a new channel post, but Gemini did not find "
+                "a clear event end date/deadline.\n"
+                f"{title_hint}"
+                "Tip: Use /admin → Set Reminder Post if you want to schedule a reminder manually."
+            ),
+            post_link=post_link,
+            dedupe_key=f"no_deadline:{post.message_id}",
+        )
         return
 
-    # Do not notify the admin for events whose extracted deadline is already in the past
+    # 4. Guard against already-expired extracted deadlines
     if date.fromisoformat(extraction.end_date) < today:
         logger.info(
             "Ignoring past deadline (%s < %s) detected in channel post %s/%d",
@@ -557,29 +764,67 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             post.chat.id,
             post.message_id,
         )
+        await _notify_admin_notice(
+            context,
+            "Channel Post Seen — Past Deadline Ignored",
+            (
+                f"Detected event: {extraction.title or _fallback_title_from_text(post_text)}\n"
+                f"Extracted end date ({extraction.end_date}) is earlier than today "
+                f"({today.isoformat()}), so no reminder confirmation card was created."
+            ),
+            post_link=post_link,
+            dedupe_key=f"past_deadline:{post.message_id}",
+        )
         return
 
+    # 5. Persist pending reminder in Supabase
     title = extraction.title or _fallback_title_from_text(post_text)
-    reminder = await db.create_reminder(
-        channel_id=post.chat.id,
-        message_id=post.message_id,
-        post_link=post_link,
-        title=title,
-        post_text=post_text,
-        start_date=extraction.start_date,
-        end_date=extraction.end_date,
-        status="pending",
-    )
-
-    admin_id: int = context.bot_data["admin_user_id"]
     try:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=_format_detection_message(reminder, today),
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_detection_confirm_keyboard(reminder.id),
-            disable_web_page_preview=True,
+        reminder = await db.create_reminder(
+            channel_id=post.chat.id,
+            message_id=post.message_id,
+            post_link=post_link,
+            title=title,
+            post_text=post_text,
+            start_date=extraction.start_date,
+            end_date=extraction.end_date,
+            status="pending",
         )
+    except Exception as exc:
+        logger.exception("Failed to create pending reminder for %s/%d", post.chat.id, post.message_id)
+        await _notify_admin_error(
+            context,
+            "Database Error",
+            exc,
+            context_info=f"Saving pending reminder '{title}' ({post_link})",
+            dedupe_key=f"create_rem_err:{post.message_id}",
+        )
+        return
+
+    # 6. Send Confirm / Decline approval card privately to ADMIN_USER_ID
+    admin_id: int = context.bot_data["admin_user_id"]
+    keyboard = build_detection_confirm_keyboard(reminder.id)
+    try:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=_format_detection_message(reminder, today),
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as html_exc:
+            logger.warning(
+                "HTML detection message failed for reminder #%d (%s); retrying plain text",
+                reminder.id,
+                html_exc,
+            )
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=_format_detection_plain_fallback(reminder, today),
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
         logger.info(
             "Sent pending reminder #%d (%s, end=%s) to admin %d",
             reminder.id,
@@ -587,31 +832,32 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             reminder.end_date,
             admin_id,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to notify admin %d about reminder #%d", admin_id, reminder.id)
+        await _notify_admin_error(
+            context,
+            "Channel Post Detection",
+            exc,
+            context_info=f"Sending Confirm/Decline card for reminder #{reminder.id} ({reminder.title})",
+            dedupe_key=f"notify_card_err:{reminder.id}",
+        )
+
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Monitor incoming channel posts."""
+    if update.channel_post is None:
+        return
+    await _process_channel_post(update.channel_post, context, is_edit=False)
 
 
 async def handle_edited_channel_post(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Keep the channel post cache updated when channel posts are edited."""
-    post = update.edited_channel_post
-    if post is None:
+    """Update cache and detect newly added deadlines on edited channel posts."""
+    if update.edited_channel_post is None:
         return
-    if not _matches_channel(post.chat, _get_channel_id(context)):
-        return
-    post_text = (post.text or post.caption or "").strip()
-    if not post_text:
-        return
-    db = _get_db(context)
-    await db.cache_channel_post(
-        channel_id=post.chat.id,
-        channel_username=post.chat.username,
-        message_id=post.message_id,
-        post_text=post_text,
-        post_link=build_post_link(post.chat, post.message_id),
-    )
+    await _process_channel_post(update.edited_channel_post, context, is_edit=True)
 
 
 # ======================================================================
@@ -986,6 +1232,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as exc:
             logger.exception("Instant reminder dispatch failed for reminder #%d", reminder.id)
             await _safe_answer(query, f"❌ Failed to send: {exc}", show_alert=True)
+            await _notify_admin_error(
+                context,
+                "Instant Reminder",
+                exc,
+                context_info=f"Reminder #{reminder.id} ({reminder.title}) → channel {target_channel}",
+                dedupe_key=f"instant_err:{reminder.id}",
+            )
             return
 
         refreshed = await db.get_reminder(reminder.id) or reminder
@@ -1251,7 +1504,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "manual:confirm":
-        # Pop immediately to prevent duplicate inserts from rapid double-clicks
         flow = context.user_data.pop("manual_flow", None)
         if (
             not flow
@@ -1301,10 +1553,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 status="active",
             )
         except Exception as exc:
-            # Restore session state on transient DB failure so the admin can retry
             context.user_data["manual_flow"] = flow
             logger.exception("Failed to save manual reminder to database")
             await _safe_answer(query, f"❌ Database error: {exc}", show_alert=True)
+            await _notify_admin_error(
+                context,
+                "Database Error",
+                exc,
+                context_info=f"Saving manual reminder '{flow.get('title')}' ({flow.get('post_link')})",
+            )
             return
 
         await _safe_answer(query, "✅ Reminder saved and activated!")
@@ -1350,8 +1607,15 @@ async def _run_manual_gemini_and_advance(
     extraction = None
     try:
         extraction = await parser.extract_deadline(post_text=post_text, current_date=today)
-    except Exception:
+    except Exception as exc:
         logger.exception("Gemini extraction error during manual post entry")
+        await _notify_admin_error(
+            context,
+            "Gemini Parsing",
+            exc,
+            context_info=f"Manual post {flow.get('post_link')} | Model: {parser.model}",
+            dedupe_key=f"manual_gemini_err:{flow.get('message_id')}",
+        )
 
     if extraction is not None:
         if extraction.title:
@@ -1361,7 +1625,6 @@ async def _run_manual_gemini_and_advance(
         if extraction.end_date and date.fromisoformat(extraction.end_date) >= today:
             flow["end_date"] = extraction.end_date
 
-    # Missing End Date Fallback
     if not flow.get("end_date"):
         flow["step"] = "awaiting_end_date"
         detected_title_note = (
@@ -1381,7 +1644,6 @@ async def _run_manual_gemini_and_advance(
         )
         return
 
-    # Missing Title Fallback
     if not flow.get("title"):
         flow["step"] = "awaiting_title"
         await message.reply_text(
@@ -1392,7 +1654,6 @@ async def _run_manual_gemini_and_advance(
         )
         return
 
-    # Both End Date and Title are ready -> show Event Overview & Window selection
     flow["step"] = "configuring"
     await message.reply_text(
         _format_manual_overview(flow, today)
@@ -1418,7 +1679,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     db = _get_db(context)
     today = db.today()
 
-    # Step 1: Receive Telegram channel post link
     if step == "awaiting_link":
         raw_text = (message.text or message.caption or "").strip()
         parsed = parse_telegram_post_link(raw_text)
@@ -1483,7 +1743,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Step 2: Receive forwarded post or pasted text on cache miss
     if step == "awaiting_post_text":
         post_text = (message.text or message.caption or "").strip()
         if not post_text:
@@ -1495,19 +1754,27 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-        await db.cache_channel_post(
-            channel_id=flow["channel_id"],
-            channel_username=flow.get("channel_username"),
-            message_id=int(flow["message_id"]),
-            post_text=post_text,
-            post_link=flow["post_link"],
-        )
+        try:
+            await db.cache_channel_post(
+                channel_id=flow["channel_id"],
+                channel_username=flow.get("channel_username"),
+                message_id=int(flow["message_id"]),
+                post_text=post_text,
+                post_link=flow["post_link"],
+            )
+        except Exception as exc:
+            logger.exception("Failed caching manually supplied post text")
+            await _notify_admin_error(
+                context,
+                "Database Error",
+                exc,
+                context_info=f"Caching manual post text for {flow.get('post_link')}",
+            )
 
         await message.reply_text("🤖 Analyzing post text with Gemini...")
         await _run_manual_gemini_and_advance(update, context, flow, post_text)
         return
 
-    # Step 3a: Manual End Date fallback
     if step == "awaiting_end_date":
         raw_date = (message.text or "").strip()
         parsed_date = parse_user_date(raw_date)
@@ -1555,7 +1822,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Step 3b: Manual Title fallback
     if step == "awaiting_title":
         title = " ".join((message.text or "").strip().split())
         if not title:
@@ -1583,13 +1849,40 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler for unexpected Telegram or handler exceptions."""
-    logger.exception("Unhandled exception while processing update %s", update, exc_info=context.error)
+    """Global error handler that logs AND sends an instant loop-safe alert to ADMIN_USER_ID."""
+    err = context.error
+    logger.exception("Unhandled exception while processing update %s", update, exc_info=err)
+    if err is None:
+        return
+
+    update_summary = "Background / polling update"
+    if isinstance(update, Update):
+        if update.channel_post is not None:
+            update_summary = (
+                f"channel_post chat={update.channel_post.chat.id} "
+                f"msg={update.channel_post.message_id}"
+            )
+        elif update.edited_channel_post is not None:
+            update_summary = (
+                f"edited_channel_post chat={update.edited_channel_post.chat.id} "
+                f"msg={update.edited_channel_post.message_id}"
+            )
+        elif update.callback_query is not None:
+            update_summary = f"callback_query data={update.callback_query.data!r}"
+        elif update.effective_message is not None:
+            update_summary = f"message chat={update.effective_chat.id if update.effective_chat else None}"
+
+    await _notify_admin_error(
+        context,
+        "Unhandled Error",
+        err,
+        context_info=update_summary,
+    )
 
 
 def register_handlers(application: Application) -> None:
     """Attach access gatekeeper, channel monitors, admin commands, callbacks, and error handler."""
-    # Group -1: Ironclad private admin-only gatekeeper (runs BEFORE all handlers)
+    # Group -1: Ironclad private admin-only gatekeeper (never blocks channel_post / edited_channel_post)
     application.add_handler(TypeHandler(Update, enforce_admin_access), group=-1)
 
     # Group 0: Channel monitoring

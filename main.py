@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Union
@@ -16,7 +17,12 @@ from telegram.ext import Application, ApplicationBuilder
 from database import Database, prepare_postgres_dsn, resolve_timezone
 from gemini_parser import DEFAULT_GEMINI_MODEL, GeminiDeadlineParser
 from handlers import register_handlers
-from scheduler import ReminderScheduler
+from scheduler import AdminNotifier, ReminderScheduler
+
+_CHANNEL_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/@?([A-Za-z][A-Za-z0-9_]{3,})/?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,21 +41,32 @@ class BotConfig:
 
 
 def _require_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
+    value = os.getenv(name, "").strip().strip("\"'")
     if not value:
         raise ValueError(f"Missing required environment variable: {name}")
     return value
 
 
 def _parse_channel_id(raw: str) -> Union[int, str]:
-    cleaned = raw.strip()
-    if cleaned.lstrip("-").isdigit():
+    """Normalize CHANNEL_ID from -100..., bare internal digits, @username, or t.me/username."""
+    cleaned = raw.strip().strip("\"'")
+    if cleaned.startswith("-100") and cleaned[4:].isdigit():
         return int(cleaned)
-    return cleaned
+    if cleaned.startswith("-") and cleaned[1:].isdigit():
+        return int(cleaned)
+    if cleaned.isdigit():
+        # Users frequently copy the internal ID from https://t.me/c/<internal_id>/123 without -100
+        return int(f"-100{cleaned}")
+    url_match = _CHANNEL_URL_RE.match(cleaned)
+    if url_match:
+        return f"@{url_match.group(1)}"
+    if cleaned.startswith("@"):
+        return cleaned
+    return f"@{cleaned}"
 
 
 def _parse_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
+    raw = os.getenv(name, "").strip().strip("\"'")
     if not raw:
         return default
     try:
@@ -76,10 +93,9 @@ def load_config() -> BotConfig:
     channel_id = _parse_channel_id(_require_env("CHANNEL_ID"))
 
     database_url = _require_env("DATABASE_URL")
-    # Validate DSN shape early before starting Telegram polling
     prepare_postgres_dsn(database_url)
 
-    timezone = os.getenv("TIMEZONE", "Asia/Dhaka").strip() or "Asia/Dhaka"
+    timezone = os.getenv("TIMEZONE", "Asia/Dhaka").strip().strip("\"'") or "Asia/Dhaka"
     try:
         resolve_timezone(timezone)
     except ZoneInfoNotFoundError as exc:
@@ -87,7 +103,9 @@ def load_config() -> BotConfig:
             f"Unknown TIMEZONE '{timezone}'. Install 'tzdata' and use a valid IANA timezone."
         ) from exc
 
-    gemini_model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    gemini_model = (
+        os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip().strip("\"'") or DEFAULT_GEMINI_MODEL
+    )
 
     daily_hour = _parse_int_env("DAILY_REMINDER_HOUR", 10)
     daily_minute = _parse_int_env("DAILY_REMINDER_MINUTE", 0)
@@ -122,17 +140,76 @@ def configure_logging() -> None:
 
 
 async def _on_post_init(application: Application) -> None:
-    """Connect to Supabase PostgreSQL and start APScheduler once the event loop is ready."""
+    """Connect to Supabase, verify channel access, and start APScheduler on worker boot."""
+    logger = logging.getLogger(__name__)
+    admin_id: int = application.bot_data["admin_user_id"]
+    notifier = AdminNotifier(bot=application.bot, admin_user_id=admin_id)
+    application.bot_data["notifier"] = notifier
+
     db: Database = application.bot_data["db"]
-    await db.connect()
+    try:
+        await db.connect()
+    except Exception as exc:
+        logger.exception("Database connection failed on startup")
+        await notifier.notify_error(
+            "Database Error",
+            exc,
+            context_info="Worker startup could not connect to Supabase PostgreSQL",
+            dedupe_key="startup_db_err",
+        )
+        raise
+
+    # Resolve canonical numeric channel ID & verify bot access on startup
+    configured_channel = application.bot_data["channel_id"]
+    effective_target_channel = configured_channel
+    try:
+        chat = await application.bot.get_chat(configured_channel)
+        application.bot_data["resolved_channel_id"] = chat.id
+        if chat.username:
+            application.bot_data["resolved_channel_username"] = chat.username.lower()
+        effective_target_channel = chat.id
+        logger.info(
+            "Verified target channel access: id=%s, title=%r, username=%s",
+            chat.id,
+            getattr(chat, "title", None),
+            chat.username,
+        )
+        try:
+            me = await application.bot.get_me()
+            member = await application.bot.get_chat_member(chat.id, me.id)
+            if member.status not in {"administrator", "creator"}:
+                await notifier.notify_error(
+                    "Channel Setup Check",
+                    (
+                        f"Bot is currently '{member.status}' in channel {chat.id} "
+                        "(not an administrator). Telegram only delivers channel_post updates "
+                        "when the bot is an Admin with Post Messages permission."
+                    ),
+                    context_info=f"Configured CHANNEL_ID={configured_channel}",
+                    dedupe_key="startup_not_admin",
+                )
+        except Exception as member_exc:
+            logger.warning("Could not verify bot admin role in channel %s: %s", chat.id, member_exc)
+    except Exception as chat_exc:
+        logger.exception("Could not access configured CHANNEL_ID=%s on startup", configured_channel)
+        await notifier.notify_error(
+            "Channel Setup Check",
+            chat_exc,
+            context_info=(
+                f"Configured CHANNEL_ID={configured_channel}. Ensure the bot is added as "
+                "an Administrator to the channel and CHANNEL_ID is correct."
+            ),
+            dedupe_key="startup_channel_err",
+        )
 
     scheduler = ReminderScheduler(
         bot=application.bot,
         db=db,
-        target_channel_id=application.bot_data["channel_id"],
+        target_channel_id=effective_target_channel,
         timezone=application.bot_data["timezone"],
         daily_hour=application.bot_data["daily_hour"],
         daily_minute=application.bot_data["daily_minute"],
+        notifier=notifier,
     )
     scheduler.start()
     application.bot_data["scheduler"] = scheduler
@@ -193,13 +270,9 @@ def main() -> None:
         config.gemini_model,
     )
 
+    # Explicitly accept all update types so channel_post & edited_channel_post are always delivered
     application.run_polling(
-        allowed_updates=[
-            Update.CHANNEL_POST,
-            Update.EDITED_CHANNEL_POST,
-            Update.MESSAGE,
-            Update.CALLBACK_QUERY,
-        ],
+        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )
 
