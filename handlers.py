@@ -470,7 +470,12 @@ def _window_cap_note(max_days: int) -> str:
 
 def _is_bot_reminder_post(post_text: str) -> bool:
     """Return True if text matches the bot's own channel reminder format to avoid self-loops."""
-    return "Event ending " in post_text and "Event link:-" in post_text
+    if "Event ending " in post_text and "Event link:-" in post_text:
+        return True
+    has_header = (
+        "EVENT DEADLINE REMINDER" in post_text or "INSTANT DEADLINE REMINDER" in post_text
+    )
+    return has_header and "Open Original Post" in post_text
 
 
 def _format_days_left_label(days_left: int) -> str:
@@ -1454,6 +1459,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         target_channel = _get_channel_id(context)
+        tz_name = context.bot_data.get("timezone", "Asia/Dhaka")
         try:
             await post_reminder_to_channel(
                 bot=context.bot,
@@ -1461,6 +1467,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reminder=reminder,
                 db=db,
                 today=today,
+                timezone_name=tz_name,
+                is_instant=True,
             )
         except Exception as exc:
             logger.exception("Instant reminder dispatch failed for reminder #%d", reminder.id)

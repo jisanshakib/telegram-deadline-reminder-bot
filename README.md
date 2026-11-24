@@ -11,7 +11,7 @@ A production-ready, async Python Telegram Bot worker (`python-telegram-bot` v21+
 - **Automatic Channel Monitoring & Gemini Extraction:**
   - Listens to `channel_post` and `edited_channel_post` updates on your configured `CHANNEL_ID`.
   - Caches post text in Supabase (`channel_posts_cache`) for manual link lookups.
-  - Uses `google-genai` (`gemini-4-hydrogen` default) with Pydantic `response_schema` structured JSON output, automatic timeout/retry handling, and `Asia/Dhaka` date resolution.
+  - Uses `google-genai` (`gemini-4-hydrogen` default with automatic `503 UNAVAILABLE` / transient retry + backoff and automatic fallback across `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, and `gemini-4-argon`, configurable via `GEMINI_MODEL` and `GEMINI_FALLBACK_MODELS`) with Pydantic `response_schema` structured JSON output and `Asia/Dhaka` date resolution.
   - Ignores already-expired historical posts and constructs canonical public (`https://t.me/<username>/<msg_id>`) and private (`https://t.me/c/<internal_id>/<msg_id>`) links.
 - **Multi-Step Admin Confirmation Flow:**
   - Sends detected deadlines privately to `ADMIN_USER_ID` with **Confirm** / **Decline** inline buttons.
@@ -103,7 +103,7 @@ A pre-cleaned **`github_upload/`** staging folder is provided inside the project
    - `CHANNEL_ID`
    - `DATABASE_URL` *(your Supabase PostgreSQL URI)*
    - `TIMEZONE` = `Asia/Dhaka`
-   - *(Optional)* `GEMINI_MODEL` = `gemini-4-hydrogen`, `DAILY_REMINDER_HOUR` = `10`, `DAILY_REMINDER_MINUTE` = `0`
+   - *(Optional)* `GEMINI_MODEL` = `gemini-4-hydrogen`, `GEMINI_FALLBACK_MODELS` = `gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-4-argon`, `DAILY_REMINDER_HOUR` = `10`, `DAILY_REMINDER_MINUTE` = `0`
 4. Keep **Replicas = 1** (Telegram long-polling allows only one active `getUpdates` poller per bot token).
 5. Check **Deploy Logs** — you should see:
    - `Connected to Supabase PostgreSQL database pool`
@@ -133,11 +133,20 @@ python -u main.py
 
 ## Channel Reminder Format
 
-Both automated and instant reminders are posted to your channel in this exact HTML format (with `Open` linked to the original post):
+Both automated and instant reminders are posted to your channel in a clean, bold, emoji-rich HTML layout (safely HTML-escaped and capped within Telegram's 4096-character limit):
 
 ```text
-{title}
-Event ending {end_date}
+⏰ EVENT DEADLINE REMINDER
+━━━━━━━━━━━━━━━━━━━━
 
-Event link:- Open
+📌 Winter AI Hackathon 2026
+
+🔥 1 Day Left — Ends Tomorrow!
+🗓 Deadline: 2026-12-10 (Asia/Dhaka)
+🔁 Schedule: Last 5 Days • Normal (Daily)
+
+🔗 Event Post: Open Original Post ↗
+
+━━━━━━━━━━━━━━━━━━━━
+✨ Don't miss out — complete your action before the deadline closes!
 ```

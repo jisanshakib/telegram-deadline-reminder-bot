@@ -15,7 +15,11 @@ from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
 from database import Database, prepare_postgres_dsn, resolve_timezone
-from gemini_parser import DEFAULT_GEMINI_MODEL, GeminiDeadlineParser
+from gemini_parser import (
+    DEFAULT_FALLBACK_MODELS,
+    DEFAULT_GEMINI_MODEL,
+    GeminiDeadlineParser,
+)
 from handlers import register_handlers
 from scheduler import AdminNotifier, ReminderScheduler
 
@@ -36,6 +40,7 @@ class BotConfig:
     database_url: str
     timezone: str
     gemini_model: str
+    gemini_fallback_models: tuple[str, ...]
     daily_reminder_hour: int
     daily_reminder_minute: int
 
@@ -106,6 +111,13 @@ def load_config() -> BotConfig:
     gemini_model = (
         os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip().strip("\"'") or DEFAULT_GEMINI_MODEL
     )
+    raw_fallbacks = os.getenv("GEMINI_FALLBACK_MODELS", "").strip().strip("\"'")
+    if raw_fallbacks:
+        gemini_fallback_models = tuple(
+            item.strip() for item in raw_fallbacks.split(",") if item.strip()
+        )
+    else:
+        gemini_fallback_models = DEFAULT_FALLBACK_MODELS
 
     daily_hour = _parse_int_env("DAILY_REMINDER_HOUR", 10)
     daily_minute = _parse_int_env("DAILY_REMINDER_MINUTE", 0)
@@ -120,6 +132,7 @@ def load_config() -> BotConfig:
         database_url=database_url,
         timezone=timezone,
         gemini_model=gemini_model,
+        gemini_fallback_models=gemini_fallback_models,
         daily_reminder_hour=daily_hour,
         daily_reminder_minute=daily_minute,
     )
@@ -242,6 +255,7 @@ def main() -> None:
         api_key=config.gemini_api_key,
         model=config.gemini_model,
         timezone_name=config.timezone,
+        fallback_models=config.gemini_fallback_models,
     )
 
     application = (
@@ -268,11 +282,11 @@ def main() -> None:
     register_handlers(application)
 
     logger.info(
-        "Starting Telegram Deadline Reminder Worker (channel=%s, admin=%d, tz=%s, model=%s)",
+        "Starting Telegram Deadline Reminder Worker (channel=%s, admin=%d, tz=%s, models=%s)",
         config.channel_id,
         config.admin_user_id,
         config.timezone,
-        config.gemini_model,
+        " -> ".join(parser.model_chain),
     )
 
     # Explicitly accept all update types so channel_post & edited_channel_post are always delivered

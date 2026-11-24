@@ -181,16 +181,81 @@ class AdminNotifier:
         return await self._send_safe(html_msg, plain_msg)
 
 
-def format_channel_reminder(title: str, end_date: str, post_link: str) -> str:
-    """Format the exact HTML message posted to the Telegram channel."""
-    safe_title = html.escape(title.strip())
+def _format_countdown_badge(days_left: Optional[int]) -> str:
+    """Return a bold, emoji-rich urgency badge based on remaining days."""
+    if days_left is None:
+        return "⏳ <b>Deadline Approaching</b>"
+    if days_left < 0:
+        return f"⌛ <b>Ended {abs(days_left)} Day(s) Ago</b>"
+    if days_left == 0:
+        return "🚨 <b>FINAL DAY — Ends Today!</b>"
+    if days_left == 1:
+        return "🔥 <b>1 Day Left — Ends Tomorrow!</b>"
+    if days_left <= 3:
+        return f"⚡ <b>{days_left} Days Left — Closing Soon!</b>"
+    return f"⏳ <b>{days_left} Days Remaining</b>"
+
+
+def format_channel_reminder(
+    title: str,
+    end_date: str,
+    post_link: str,
+    *,
+    days_left: Optional[int] = None,
+    window_label: Optional[str] = None,
+    repeat_mode_label: Optional[str] = None,
+    timezone_name: str = "Asia/Dhaka",
+    is_instant: bool = False,
+) -> str:
+    """Format a bold, unique, emoji-rich HTML reminder post safely within 4096 chars."""
+    raw_title = " ".join(title.strip().split()) or "Untitled Event"
+    if len(raw_title) > 180:
+        raw_title = f"{raw_title[:179].rstrip()}…"
+
+    safe_title = html.escape(raw_title)
     safe_end_date = html.escape(end_date.strip())
     safe_link = html.escape(post_link.strip(), quote=True)
-    return (
-        f"{safe_title}\n"
-        f"Event ending {safe_end_date}\n\n"
-        f'Event link:- <a href="{safe_link}">Open</a>'
+    safe_tz = html.escape(timezone_name.strip() or "Asia/Dhaka")
+
+    header = (
+        "⚡ <b>INSTANT DEADLINE REMINDER</b>"
+        if is_instant
+        else "⏰ <b>EVENT DEADLINE REMINDER</b>"
     )
+    divider = "━━━━━━━━━━━━━━━━━━━━"
+    countdown_badge = _format_countdown_badge(days_left)
+
+    schedule_line = ""
+    if window_label and repeat_mode_label:
+        schedule_line = (
+            f"\n🔁 <b>Schedule:</b> <b>{html.escape(window_label)}</b> • "
+            f"<b>{html.escape(repeat_mode_label)}</b>"
+        )
+    elif repeat_mode_label:
+        schedule_line = f"\n🔁 <b>Mode:</b> <b>{html.escape(repeat_mode_label)}</b>"
+
+    message = (
+        f"{header}\n"
+        f"{divider}\n\n"
+        f"📌 <b>{safe_title}</b>\n\n"
+        f"{countdown_badge}\n"
+        f"🗓 <b>Deadline:</b> <code>{safe_end_date}</code> <i>({safe_tz})</i>"
+        f"{schedule_line}\n\n"
+        f'🔗 <b>Event Post:</b> <a href="{safe_link}"><b>Open Original Post ↗</b></a>\n\n'
+        f"{divider}\n"
+        "✨ <i>Don't miss out — complete your action before the deadline closes!</i>"
+    )
+
+    if len(message) > 4096:
+        compact_title = html.escape(raw_title[:80])
+        message = (
+            f"{header}\n"
+            f"📌 <b>{compact_title}</b>\n"
+            f"{countdown_badge}\n"
+            f"🗓 <b>Deadline:</b> <code>{safe_end_date}</code> <i>({safe_tz})</i>\n"
+            f'🔗 <b>Event Post:</b> <a href="{safe_link}"><b>Open ↗</b></a>'
+        )
+    return message
 
 
 def should_send_scheduled_reminder(reminder: Reminder, today: date) -> bool:
@@ -259,12 +324,19 @@ async def post_reminder_to_channel(
     reminder: Reminder,
     db: Database,
     today: date,
+    timezone_name: str = "Asia/Dhaka",
+    is_instant: bool = True,
 ) -> None:
     """Send an instant reminder to the target channel and update last_reminded_on."""
     message_text = format_channel_reminder(
         title=reminder.title,
         end_date=reminder.end_date,
         post_link=reminder.post_link,
+        days_left=reminder.days_left(today),
+        window_label=reminder.window_label if reminder.window_days else None,
+        repeat_mode_label=reminder.repeat_mode_label if reminder.repeat_mode else None,
+        timezone_name=timezone_name,
+        is_instant=is_instant,
     )
     await _send_channel_html_with_retry(
         bot=bot,
@@ -466,6 +538,11 @@ class ReminderScheduler:
                     title=reminder.title,
                     end_date=reminder.end_date,
                     post_link=reminder.post_link,
+                    days_left=days_left,
+                    window_label=reminder.window_label if reminder.window_days else None,
+                    repeat_mode_label=reminder.repeat_mode_label if reminder.repeat_mode else None,
+                    timezone_name=self.timezone_name,
+                    is_instant=False,
                 )
 
                 try:
