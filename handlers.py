@@ -23,7 +23,14 @@ from telegram.ext import (
     filters,
 )
 
-from database import Database, Reminder, extract_internal_channel_id
+from database import (
+    Database,
+    Reminder,
+    compute_days_left,
+    compute_max_allowed_window_days,
+    extract_internal_channel_id,
+    is_expired_date,
+)
 from gemini_parser import GeminiDeadlineParser
 from keyboards import (
     WINDOW_OPTIONS,
@@ -41,6 +48,7 @@ from keyboards import (
     build_post_activation_keyboard,
     build_repeat_mode_keyboard,
     build_window_selection_keyboard,
+    get_allowed_window_options,
 )
 from scheduler import AdminNotifier, post_reminder_to_channel
 
@@ -413,6 +421,51 @@ async def _handle_missing_reminder(
         reply_markup=build_main_menu_keyboard(),
         context=context,
     )
+
+
+async def _handle_expired_reminder(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    db: Database,
+    reminder: Reminder,
+    today: date,
+) -> None:
+    """Mark an expired reminder as expired and reject activation or editing."""
+    if reminder.status in {"pending", "active"}:
+        try:
+            await db.update_reminder_status(reminder.id, "expired")
+        except Exception as exc:
+            logger.exception("Failed marking reminder #%d as expired", reminder.id)
+            await _notify_admin_error(
+                context,
+                "Database Error",
+                exc,
+                context_info=f"Expiring reminder #{reminder.id} ({reminder.title})",
+            )
+
+    tz_name = context.bot_data.get("timezone", "Asia/Dhaka")
+    days_overdue = abs(reminder.days_left(today))
+    await _safe_answer(
+        query,
+        f"⛔ Deadline expired ({reminder.end_date} < {today.isoformat()}). Cannot schedule.",
+        show_alert=True,
+    )
+    await _safe_edit_message(
+        query,
+        "⛔ <b>Event Deadline Already Expired</b>\n\n"
+        f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
+        f"⏳ <b>End Date:</b> <code>{html.escape(reminder.end_date)}</code> "
+        f"({days_overdue} day(s) ago)\n"
+        f"📅 <b>Today ({html.escape(tz_name)}):</b> <code>{today.isoformat()}</code>\n\n"
+        "Expired events cannot be activated or scheduled. Marked as <b>Expired</b>.",
+        reply_markup=build_main_menu_keyboard(),
+        context=context,
+    )
+
+
+def _window_cap_note(max_days: int) -> str:
+    unit = "day" if max_days == 1 else "days"
+    return f"<i>Available options are capped at {max_days} {unit} based on this event's remaining time/duration.</i>"
 
 
 def _is_bot_reminder_post(post_text: str) -> bool:
@@ -847,6 +900,33 @@ async def _process_channel_post(
         if getattr(extraction, "decision_reason", None)
         else ""
     )
+    tz_name = context.bot_data.get("timezone", "Asia/Dhaka")
+
+    # 4a. Strictly reject already-expired deadlines BEFORE creating any pending reminder or prompt
+    if extraction.end_date and is_expired_date(extraction.end_date, today):
+        days_overdue = abs(compute_days_left(extraction.end_date, today))
+        logger.info(
+            "Rejecting expired deadline (%s < %s, %dd ago) in channel post %s/%d",
+            extraction.end_date,
+            today.isoformat(),
+            days_overdue,
+            post.chat.id,
+            post.message_id,
+        )
+        await _notify_admin_notice(
+            context,
+            "Channel Post Ignored — Deadline Already Expired",
+            (
+                f"Detected event: {extraction.title or _fallback_title_from_text(post_text)}\n"
+                f"Extracted end date ({extraction.end_date}) is already in the past "
+                f"({days_overdue} day(s) before today {today.isoformat()} {tz_name}).\n"
+                f"{reason_line}"
+                "No pending reminder or confirmation prompt was created."
+            ),
+            post_link=post_link,
+            dedupe_key=f"past_deadline:{post.message_id}",
+        )
+        return
 
     if not (extraction.has_deadline and extraction.end_date):
         logger.info(
@@ -868,29 +948,6 @@ async def _process_channel_post(
             ),
             post_link=post_link,
             dedupe_key=f"no_deadline:{post.message_id}",
-        )
-        return
-
-    # 4. Guard against already-expired extracted deadlines
-    if date.fromisoformat(extraction.end_date) < today:
-        logger.info(
-            "Ignoring past deadline (%s < %s) detected in channel post %s/%d",
-            extraction.end_date,
-            today.isoformat(),
-            post.chat.id,
-            post.message_id,
-        )
-        await _notify_admin_notice(
-            context,
-            "Channel Post Checked — Past Deadline Ignored",
-            (
-                f"Detected event: {extraction.title or _fallback_title_from_text(post_text)}\n"
-                f"Extracted end date ({extraction.end_date}) is earlier than today "
-                f"({today.isoformat()}), so no reminder confirmation card was created.\n"
-                f"{reason_line}".rstrip()
-            ),
-            post_link=post_link,
-            dedupe_key=f"past_deadline:{post.message_id}",
         )
         return
 
@@ -1132,6 +1189,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if reminder is None:
             await _handle_missing_reminder(query, context)
             return
+        if reminder.is_expired(today):
+            await _handle_expired_reminder(query, context, db, reminder, today)
+            return
         if reminder.status != "pending":
             await _safe_answer(
                 query,
@@ -1154,6 +1214,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
             await _handle_missing_reminder(query, context)
+            return
+        if reminder.is_expired(today):
+            await _handle_expired_reminder(query, context, db, reminder, today)
             return
         if reminder.status != "pending":
             await _safe_answer(
@@ -1182,6 +1245,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if reminder is None:
             await _handle_missing_reminder(query, context)
             return
+        if reminder.is_expired(today):
+            await _handle_expired_reminder(query, context, db, reminder, today)
+            return
         if reminder.status != "pending":
             await _safe_answer(
                 query,
@@ -1191,17 +1257,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await _safe_answer(query)
         duration_text = _format_duration_text(reminder.start_date, reminder.end_date, today)
+        max_days = reminder.max_allowed_window_days(today)
         await _edit(
             "🪟 <b>Step 1 of 2 — Select Reminder Window</b>\n\n"
             f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
             f"🗓 <b>Start Date:</b> {html.escape(reminder.start_date or 'N/A')}\n"
             f"⏳ <b>End Date:</b> {html.escape(reminder.end_date)}\n"
             f"⏱ <b>Total Duration:</b> {html.escape(duration_text)}\n\n"
-            "How many days before the deadline should reminders run?",
+            "How many days before the deadline should reminders run?\n"
+            f"{_window_cap_note(max_days)}",
             reply_markup=build_window_selection_keyboard(
                 reminder.id,
                 prefix="win",
                 back_callback=f"detect_back:{reminder.id}",
+                max_days=max_days,
             ),
         )
         return
@@ -1216,11 +1285,38 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if reminder is None:
             await _handle_missing_reminder(query, context)
             return
+        if reminder.is_expired(today):
+            await _handle_expired_reminder(query, context, db, reminder, today)
+            return
         if reminder.status != "pending":
             await _safe_answer(
                 query,
                 f"This reminder is already {reminder.status}.",
                 show_alert=True,
+            )
+            return
+        max_days = reminder.max_allowed_window_days(today)
+        allowed_options = get_allowed_window_options(max_days)
+        if window_days > max_days or window_days not in allowed_options:
+            await _safe_answer(
+                query,
+                f"⚠️ Window cannot exceed {max_days} day(s) for this event.",
+                show_alert=True,
+            )
+            duration_text = _format_duration_text(reminder.start_date, reminder.end_date, today)
+            await _edit(
+                "🪟 <b>Step 1 of 2 — Select Reminder Window</b>\n\n"
+                f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
+                f"⏳ <b>End Date:</b> {html.escape(reminder.end_date)}\n"
+                f"⏱ <b>Total Duration:</b> {html.escape(duration_text)}\n\n"
+                f"⚠️ Selected window ({window_days} days) exceeds this event's limit.\n"
+                f"{_window_cap_note(max_days)}",
+                reply_markup=build_window_selection_keyboard(
+                    reminder.id,
+                    prefix="win",
+                    back_callback=f"detect_back:{reminder.id}",
+                    max_days=max_days,
+                ),
             )
             return
         await _safe_answer(query)
@@ -1257,11 +1353,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if existing is None:
             await _handle_missing_reminder(query, context)
             return
+        if existing.is_expired(today):
+            await _handle_expired_reminder(query, context, db, existing, today)
+            return
         if existing.status != "pending":
             await _safe_answer(
                 query,
                 f"This reminder is already {existing.status}.",
                 show_alert=True,
+            )
+            return
+
+        max_days = existing.max_allowed_window_days(today)
+        allowed_options = get_allowed_window_options(max_days)
+        if window_days > max_days or window_days not in allowed_options:
+            await _safe_answer(
+                query,
+                f"⚠️ Window cannot exceed {max_days} day(s). Please choose a valid window.",
+                show_alert=True,
+            )
+            await _edit(
+                "🪟 <b>Step 1 of 2 — Select Reminder Window</b>\n\n"
+                f"📌 <b>Event:</b> {html.escape(existing.title)}\n"
+                f"⏳ <b>End Date:</b> {html.escape(existing.end_date)}\n\n"
+                f"⚠️ Selected window ({window_days} days) exceeds this event's limit.\n"
+                f"{_window_cap_note(max_days)}",
+                reply_markup=build_window_selection_keyboard(
+                    existing.id,
+                    prefix="win",
+                    back_callback=f"detect_back:{existing.id}",
+                    max_days=max_days,
+                ),
             )
             return
 
@@ -1375,19 +1497,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if reminder is None:
             await _handle_missing_reminder(query, context)
             return
+        if reminder.is_expired(today):
+            await _handle_expired_reminder(query, context, db, reminder, today)
+            return
+        max_days = reminder.max_allowed_window_days(today)
         await _safe_answer(query)
         await _edit(
             "⚙️ <b>Edit Reminder Settings — Step 1 of 2</b>\n\n"
             f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
+            f"⏳ <b>End Date:</b> {html.escape(reminder.end_date)} "
+            f"({html.escape(_format_days_left_label(reminder.days_left(today)))})\n"
             f"🪟 <b>Current Window:</b> {html.escape(reminder.window_label)}\n"
             f"🔁 <b>Current Mode:</b> {html.escape(reminder.repeat_mode_label)}\n\n"
-            "Select the new reminder window:",
+            "Select the new reminder window:\n"
+            f"{_window_cap_note(max_days)}",
             reply_markup=build_window_selection_keyboard(
                 reminder.id,
                 prefix="edit_mode",
                 source=source,
                 current_window=reminder.window_days,
                 back_callback=f"overview:{reminder.id}:{source}",
+                max_days=max_days,
             ),
         )
         return
@@ -1402,6 +1532,32 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
             await _handle_missing_reminder(query, context)
+            return
+        if reminder.is_expired(today):
+            await _handle_expired_reminder(query, context, db, reminder, today)
+            return
+        max_days = reminder.max_allowed_window_days(today)
+        allowed_options = get_allowed_window_options(max_days)
+        if window_days > max_days or window_days not in allowed_options:
+            await _safe_answer(
+                query,
+                f"⚠️ Window cannot exceed {max_days} day(s) for this event.",
+                show_alert=True,
+            )
+            await _edit(
+                "⚙️ <b>Edit Reminder Settings — Step 1 of 2</b>\n\n"
+                f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
+                f"⚠️ Selected window ({window_days} days) exceeds this event's limit.\n"
+                f"{_window_cap_note(max_days)}",
+                reply_markup=build_window_selection_keyboard(
+                    reminder.id,
+                    prefix="edit_mode",
+                    source=source,
+                    current_window=reminder.window_days,
+                    back_callback=f"overview:{reminder.id}:{source}",
+                    max_days=max_days,
+                ),
+            )
             return
         await _safe_answer(query)
         suffix = "Day" if window_days == 1 else "Days"
@@ -1432,6 +1588,38 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             or repeat_mode not in {"normal", "alternate"}
         ):
             await _safe_answer(query, "Invalid settings.", show_alert=True)
+            return
+
+        existing = await db.get_reminder(reminder_id)
+        if existing is None:
+            await _handle_missing_reminder(query, context)
+            return
+        if existing.is_expired(today):
+            await _handle_expired_reminder(query, context, db, existing, today)
+            return
+
+        max_days = existing.max_allowed_window_days(today)
+        allowed_options = get_allowed_window_options(max_days)
+        if window_days > max_days or window_days not in allowed_options:
+            await _safe_answer(
+                query,
+                f"⚠️ Window cannot exceed {max_days} day(s) for this event.",
+                show_alert=True,
+            )
+            await _edit(
+                "⚙️ <b>Edit Reminder Settings — Step 1 of 2</b>\n\n"
+                f"📌 <b>Event:</b> {html.escape(existing.title)}\n"
+                f"⚠️ Selected window ({window_days} days) exceeds this event's limit.\n"
+                f"{_window_cap_note(max_days)}",
+                reply_markup=build_window_selection_keyboard(
+                    existing.id,
+                    prefix="edit_mode",
+                    source=source,
+                    current_window=existing.window_days,
+                    back_callback=f"overview:{existing.id}:{source}",
+                    max_days=max_days,
+                ),
+            )
             return
 
         updated = await db.update_reminder_settings(
@@ -1546,11 +1734,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 show_alert=True,
             )
             return
+        if is_expired_date(flow["end_date"], today):
+            context.user_data.pop("manual_flow", None)
+            await _safe_answer(
+                query,
+                f"⛔ Deadline {flow['end_date']} is already expired relative to today ({today.isoformat()}).",
+                show_alert=True,
+            )
+            await _edit(
+                "⛔ <b>Deadline Already Expired</b>\n\n"
+                f"End date <code>{html.escape(flow['end_date'])}</code> is before today "
+                f"(<code>{today.isoformat()}</code>) and cannot be saved or scheduled.",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
         await _safe_answer(query)
+        max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
         flow["step"] = "configuring"
         await _edit(
-            _format_manual_overview(flow, today) + "\n\n🪟 <b>Select Reminder Window:</b>",
-            reply_markup=build_manual_window_keyboard(flow.get("window_days")),
+            _format_manual_overview(flow, today)
+            + f"\n\n🪟 <b>Select Reminder Window:</b>\n{_window_cap_note(max_days)}",
+            reply_markup=build_manual_window_keyboard(flow.get("window_days"), max_days=max_days),
         )
         return
 
@@ -1563,9 +1767,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 show_alert=True,
             )
             return
+        if is_expired_date(flow["end_date"], today):
+            context.user_data.pop("manual_flow", None)
+            await _safe_answer(
+                query,
+                f"⛔ Deadline {flow['end_date']} is already expired relative to today ({today.isoformat()}).",
+                show_alert=True,
+            )
+            await _edit(
+                "⛔ <b>Deadline Already Expired</b>\n\n"
+                f"End date <code>{html.escape(flow['end_date'])}</code> is before today "
+                f"(<code>{today.isoformat()}</code>) and cannot be saved or scheduled.",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
         window_days = _parse_positive_int(parts[1])
-        if window_days not in WINDOW_OPTIONS:
-            await _safe_answer(query, "Invalid window.", show_alert=True)
+        max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
+        allowed_options = get_allowed_window_options(max_days)
+        if window_days not in allowed_options or window_days > max_days:
+            await _safe_answer(
+                query,
+                f"⚠️ Window cannot exceed {max_days} day(s) for this event.",
+                show_alert=True,
+            )
+            await _edit(
+                _format_manual_overview(flow, today)
+                + f"\n\n⚠️ Selected window exceeds this event's limit.\n{_window_cap_note(max_days)}",
+                reply_markup=build_manual_window_keyboard(flow.get("window_days"), max_days=max_days),
+            )
             return
         await _safe_answer(query)
         flow["window_days"] = window_days
@@ -1586,6 +1815,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 query,
                 "Session expired. Start again from the Admin Panel.",
                 show_alert=True,
+            )
+            return
+        if is_expired_date(flow["end_date"], today):
+            context.user_data.pop("manual_flow", None)
+            await _safe_answer(
+                query,
+                f"⛔ Deadline {flow['end_date']} is already expired.",
+                show_alert=True,
+            )
+            await _edit(
+                "⛔ <b>Deadline Already Expired</b>\n\n"
+                f"End date <code>{html.escape(flow['end_date'])}</code> is before today "
+                f"(<code>{today.isoformat()}</code>) and cannot be saved.",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
+        max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
+        if int(flow["window_days"]) > max_days:
+            flow.pop("window_days", None)
+            await _safe_answer(
+                query,
+                f"⚠️ Window exceeds current limit ({max_days} day(s)). Pick a valid window.",
+                show_alert=True,
+            )
+            await _edit(
+                _format_manual_overview(flow, today)
+                + f"\n\n🪟 <b>Select Reminder Window:</b>\n{_window_cap_note(max_days)}",
+                reply_markup=build_manual_window_keyboard(max_days=max_days),
             )
             return
         repeat_mode = parts[1]
@@ -1615,6 +1872,42 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 query,
                 "Session incomplete or already confirmed.",
                 show_alert=True,
+            )
+            return
+
+        if is_expired_date(flow["end_date"], today):
+            tz_name = context.bot_data.get("timezone", "Asia/Dhaka")
+            await _safe_answer(
+                query,
+                f"⛔ Deadline {flow['end_date']} is already expired relative to today ({today.isoformat()}).",
+                show_alert=True,
+            )
+            await _edit(
+                "⛔ <b>Expired Deadline Blocked</b>\n\n"
+                f"End date <code>{html.escape(flow['end_date'])}</code> is before today "
+                f"(<code>{today.isoformat()}</code> {html.escape(tz_name)}).\n"
+                "Expired deadlines cannot be saved or scheduled.",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
+
+        max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
+        allowed_options = get_allowed_window_options(max_days)
+        chosen_window = int(flow["window_days"])
+        if chosen_window > max_days or chosen_window not in allowed_options:
+            flow.pop("window_days", None)
+            flow.pop("repeat_mode", None)
+            flow["step"] = "configuring"
+            context.user_data["manual_flow"] = flow
+            await _safe_answer(
+                query,
+                f"⚠️ Window ({chosen_window}d) exceeds max allowed ({max_days}d). Please select again.",
+                show_alert=True,
+            )
+            await _edit(
+                _format_manual_overview(flow, today)
+                + f"\n\n🪟 <b>Select Reminder Window:</b>\n{_window_cap_note(max_days)}",
+                reply_markup=build_manual_window_keyboard(max_days=max_days),
             )
             return
 
@@ -1711,13 +2004,44 @@ async def _run_manual_gemini_and_advance(
             dedupe_key=f"manual_gemini_err:{flow.get('message_id')}",
         )
 
+    extracted_expired_date: Optional[str] = None
     if extraction is not None:
         if extraction.title:
             flow["title"] = extraction.title
         if extraction.start_date:
             flow["start_date"] = extraction.start_date
-        if extraction.end_date and date.fromisoformat(extraction.end_date) >= today:
-            flow["end_date"] = extraction.end_date
+        if extraction.end_date:
+            if is_expired_date(extraction.end_date, today):
+                extracted_expired_date = extraction.end_date
+            else:
+                flow["end_date"] = extraction.end_date
+
+    if extracted_expired_date is not None:
+        tz_name = context.bot_data.get("timezone", "Asia/Dhaka")
+        days_overdue = abs(compute_days_left(extracted_expired_date, today))
+        flow["step"] = "awaiting_end_date"
+        detected_title_note = (
+            f"📌 <b>Detected Title:</b> {html.escape(flow['title'])}\n"
+            if flow.get("title")
+            else ""
+        )
+        await _safe_reply(
+            update,
+            context,
+            "⛔ <b>Extracted Deadline Already Expired</b>\n\n"
+            f"{detected_title_note}"
+            f"⏳ <b>Extracted End Date:</b> <code>{html.escape(extracted_expired_date)}</code> "
+            f"({days_overdue} day(s) ago)\n"
+            f"📅 <b>Today ({html.escape(tz_name)}):</b> <code>{today.isoformat()}</code>\n\n"
+            "Expired deadlines cannot be saved or scheduled.\n"
+            "Click <b>Cancel</b> to abort, or enter a valid today/future <b>End Date</b> to override:\n"
+            "• <code>YYYY-MM-DD</code> (e.g. <code>2026-12-31</code>)\n"
+            "• <code>DD-MM-YYYY</code> (e.g. <code>31-12-2026</code>)\n"
+            "• <code>DD Month YYYY</code> (e.g. <code>31 December 2026</code>)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_manual_cancel_keyboard(),
+        )
+        return
 
     if not flow.get("end_date"):
         flow["step"] = "awaiting_end_date"
@@ -1752,14 +2076,15 @@ async def _run_manual_gemini_and_advance(
         )
         return
 
+    max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
     flow["step"] = "configuring"
     await _safe_reply(
         update,
         context,
         _format_manual_overview(flow, today)
-        + "\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>",
+        + f"\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>\n{_window_cap_note(max_days)}",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_manual_window_keyboard(),
+        reply_markup=build_manual_window_keyboard(max_days=max_days),
         disable_web_page_preview=True,
     )
 
@@ -1906,13 +2231,17 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-        if parsed_date < today:
+        if is_expired_date(parsed_date, today):
+            tz_name = context.bot_data.get("timezone", "Asia/Dhaka")
+            days_overdue = abs(compute_days_left(parsed_date, today))
             await _safe_reply(
                 update,
                 context,
-                f"❌ <b>Past date rejected:</b> <code>{parsed_date.isoformat()}</code> is before "
-                f"today (<code>{today.isoformat()}</code>).\n\n"
-                "Please enter today or a future End Date:",
+                f"⛔ <b>Expired date rejected:</b> <code>{parsed_date.isoformat()}</code> is "
+                f"{days_overdue} day(s) before today (<code>{today.isoformat()}</code> "
+                f"{html.escape(tz_name)}).\n\n"
+                "Expired deadlines cannot be saved or scheduled. "
+                "Please enter today or a future End Date, or click Cancel:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_manual_cancel_keyboard(),
             )
@@ -1932,14 +2261,15 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
+        max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
         flow["step"] = "configuring"
         await _safe_reply(
             update,
             context,
             _format_manual_overview(flow, today)
-            + "\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>",
+            + f"\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>\n{_window_cap_note(max_days)}",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_manual_window_keyboard(),
+            reply_markup=build_manual_window_keyboard(max_days=max_days),
             disable_web_page_preview=True,
         )
         return
@@ -1956,15 +2286,29 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
+        if is_expired_date(flow["end_date"], today):
+            context.user_data.pop("manual_flow", None)
+            await _safe_reply(
+                update,
+                context,
+                "⛔ <b>Deadline Already Expired</b>\n\n"
+                f"End date <code>{html.escape(flow['end_date'])}</code> is before today "
+                f"(<code>{today.isoformat()}</code>) and cannot be saved.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
+
         flow["title"] = title[:120]
+        max_days = compute_max_allowed_window_days(flow["end_date"], today, flow.get("start_date"))
         flow["step"] = "configuring"
         await _safe_reply(
             update,
             context,
             _format_manual_overview(flow, today)
-            + "\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>",
+            + f"\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>\n{_window_cap_note(max_days)}",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_manual_window_keyboard(),
+            reply_markup=build_manual_window_keyboard(max_days=max_days),
             disable_web_page_preview=True,
         )
         return

@@ -12,6 +12,15 @@ WINDOW_OPTIONS: tuple[int, ...] = (1, 2, 3, 5, 7, 10)
 ITEMS_PER_PAGE = 8
 
 
+def get_allowed_window_options(max_days: Optional[int]) -> tuple[int, ...]:
+    """Return valid reminder window day options capped by max_days (always >= 1)."""
+    if max_days is None:
+        return WINDOW_OPTIONS
+    cap = max(1, int(max_days))
+    allowed = tuple(days for days in WINDOW_OPTIONS if days <= cap)
+    return allowed or (1,)
+
+
 def _truncate(text: str, max_len: int = 34) -> str:
     cleaned = " ".join(text.split())
     if len(cleaned) <= max_len:
@@ -49,12 +58,13 @@ def build_window_selection_keyboard(
     source: Optional[str] = None,
     current_window: Optional[int] = None,
     back_callback: Optional[str] = None,
+    max_days: Optional[int] = None,
 ) -> InlineKeyboardMarkup:
-    """Window selection keyboard (1, 2, 3, 5, 7, 10 Days)."""
+    """Window selection keyboard dynamically capped to <= max_days (1, 2, 3, 5, 7, 10 Days)."""
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
 
-    for days in WINDOW_OPTIONS:
+    for days in get_allowed_window_options(max_days):
         suffix = "Day" if days == 1 else "Days"
         label = f"{days} {suffix}"
         if current_window == days:
@@ -298,11 +308,15 @@ def build_manual_cache_miss_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_manual_window_keyboard(current_window: Optional[int] = None) -> InlineKeyboardMarkup:
-    """Select reminder window during manual post setup."""
+def build_manual_window_keyboard(
+    current_window: Optional[int] = None,
+    *,
+    max_days: Optional[int] = None,
+) -> InlineKeyboardMarkup:
+    """Select reminder window during manual post setup, capped to <= max_days."""
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
-    for days in WINDOW_OPTIONS:
+    for days in get_allowed_window_options(max_days):
         suffix = "Day" if days == 1 else "Days"
         label = f"{days} {suffix}"
         if current_window == days:

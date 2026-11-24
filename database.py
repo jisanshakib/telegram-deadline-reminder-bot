@@ -107,6 +107,45 @@ def prepare_postgres_dsn(database_url: str) -> tuple[str, dict[str, Any]]:
     return clean_dsn, pool_kwargs
 
 
+def compute_days_left(end_date: str | date, today: date) -> int:
+    """Return calendar days remaining until end_date (`(end_date - today).days`)."""
+    end_dt = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+    return (end_dt - today).days
+
+
+def is_expired_date(end_date: str | date, today: date) -> bool:
+    """Return True strictly when end_date is before today (`days_left < 0`)."""
+    return compute_days_left(end_date, today) < 0
+
+
+def compute_max_allowed_window_days(
+    end_date: str | date,
+    today: date,
+    start_date: Optional[str | date] = None,
+) -> int:
+    """Return the maximum allowed reminder window in days (at least 1).
+
+    Caps the window by the event's available remaining days relative to `today`
+    and (when `start_date` is present and spans at least 1 day) the event's total duration.
+    """
+    end_dt = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+    days_left = (end_dt - today).days
+
+    candidates: list[int] = []
+    if days_left > 0:
+        candidates.append(days_left)
+
+    if start_date is not None:
+        start_dt = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+        span = (end_dt - start_dt).days
+        if span > 0:
+            candidates.append(span)
+
+    if not candidates:
+        return 1
+    return max(1, min(candidates))
+
+
 @dataclass(slots=True)
 class Reminder:
     """Represents a tracked event deadline reminder."""
@@ -128,7 +167,15 @@ class Reminder:
 
     def days_left(self, today: date) -> int:
         """Return number of calendar days remaining until end_date."""
-        return (date.fromisoformat(self.end_date) - today).days
+        return compute_days_left(self.end_date, today)
+
+    def is_expired(self, today: date) -> bool:
+        """Return True if this reminder's end_date is strictly before today."""
+        return is_expired_date(self.end_date, today)
+
+    def max_allowed_window_days(self, today: date) -> int:
+        """Return maximum allowed reminder window days for this reminder."""
+        return compute_max_allowed_window_days(self.end_date, today, self.start_date)
 
     def total_duration_days(self) -> Optional[int]:
         """Return total span in days if start_date is available."""
@@ -442,7 +489,22 @@ class Database:
         repeat_mode: Optional[str] = None,
         status: str = "pending",
     ) -> Reminder:
-        """Create a new reminder row and return the persisted Reminder object."""
+        """Create a new reminder row and return the persisted Reminder object.
+
+        Rejects expired end_date (< today) and out-of-range window_days for open reminders.
+        """
+        today = self.today()
+        if status in {"pending", "active"} and is_expired_date(end_date, today):
+            raise ValueError(
+                f"Cannot save expired reminder: end_date ({end_date}) is before today ({today.isoformat()})"
+            )
+        if window_days is not None:
+            max_days = compute_max_allowed_window_days(end_date, today, start_date)
+            if window_days < 1 or window_days > max_days:
+                raise ValueError(
+                    f"window_days ({window_days}) must be between 1 and {max_days} for this event"
+                )
+
         now = self._now_dt()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -597,7 +659,27 @@ class Database:
         repeat_mode: str,
         activate: bool = False,
     ) -> Optional[Reminder]:
-        """Update window_days and repeat_mode, optionally activating the reminder."""
+        """Update window_days and repeat_mode, optionally activating the reminder.
+
+        Enforces non-expired deadline and dynamic window_days cap against today's date.
+        """
+        existing = await self.get_reminder(reminder_id)
+        if existing is None:
+            return None
+
+        today = self.today()
+        if existing.is_expired(today):
+            raise ValueError(
+                f"Cannot update expired reminder #{reminder_id}: "
+                f"end_date ({existing.end_date}) is before today ({today.isoformat()})"
+            )
+
+        max_days = existing.max_allowed_window_days(today)
+        if window_days < 1 or window_days > max_days:
+            raise ValueError(
+                f"window_days ({window_days}) exceeds maximum allowed ({max_days}) for reminder #{reminder_id}"
+            )
+
         now = self._now_dt()
         async with self.pool.acquire() as conn:
             if activate:

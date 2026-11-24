@@ -209,6 +209,8 @@ def should_send_scheduled_reminder(reminder: Reminder, today: date) -> bool:
         return False
 
     days_left = reminder.days_left(today)
+    if days_left < 0:
+        return False
     if not (1 <= days_left <= reminder.window_days):
         return False
 
