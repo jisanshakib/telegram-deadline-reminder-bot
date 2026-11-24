@@ -1,0 +1,7 @@
+python-telegram-bot>=21.6,<23.0
+google-genai>=3.2.0
+asyncpg>=0.30.0
+APScheduler>=3.10.4,<4.0
+pydantic>=2.9.0
+python-dotenv>=1.0.1
+tzdata>=2024.1
