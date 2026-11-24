@@ -406,6 +406,24 @@ class Database:
 
         return None
 
+    async def delete_cached_post(
+        self,
+        channel_id: str | int,
+        message_id: int,
+    ) -> bool:
+        """Delete a cached post entry if it was removed from the channel."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                DELETE FROM channel_posts_cache
+                WHERE channel_id = $1 AND message_id = $2
+                RETURNING message_id
+                """,
+                str(channel_id).strip(),
+                int(message_id),
+            )
+        return row is not None
+
     # ------------------------------------------------------------------
     # Reminders CRUD
     # ------------------------------------------------------------------

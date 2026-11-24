@@ -317,11 +317,28 @@ async def _safe_answer(
         logger.debug("Callback answer skipped: %s", exc)
 
 
+_DELETED_OR_UNEDITABLE_MARKERS = (
+    "message to edit not found",
+    "message can't be edited",
+    "there is no text in the message to edit",
+    "message_id_invalid",
+)
+
+_DELETED_REPLY_TARGET_MARKERS = (
+    "message to be replied not found",
+    "replied message not found",
+    "message not found",
+)
+
+
 async def _safe_edit_message(
     query,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
+    *,
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None,
 ) -> None:
+    """Safely edit a callback message, recovering cleanly if the message was deleted."""
     try:
         await query.edit_message_text(
             text=text,
@@ -330,9 +347,77 @@ async def _safe_edit_message(
             disable_web_page_preview=True,
         )
     except BadRequest as exc:
-        if "Message is not modified" in str(exc):
+        err_lower = str(exc).lower()
+        if "message is not modified" in err_lower:
             return
+        if any(marker in err_lower for marker in _DELETED_OR_UNEDITABLE_MARKERS):
+            bot = getattr(context, "bot", None) if context is not None else getattr(query, "get_bot", lambda: None)()
+            chat_id = (
+                query.message.chat_id
+                if getattr(query, "message", None) is not None
+                else (context.bot_data.get("admin_user_id") if context is not None else None)
+            )
+            if bot is not None and chat_id is not None:
+                logger.info(
+                    "Original message was deleted/uneditable (%s); sending fresh message to chat %s",
+                    exc,
+                    chat_id,
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+                return
         raise
+
+
+async def _safe_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    **kwargs: Any,
+) -> None:
+    """Safely reply to an admin message, falling back to send_message if it was deleted."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is not None:
+        try:
+            await message.reply_text(text=text, **kwargs)
+            return
+        except BadRequest as exc:
+            err_lower = str(exc).lower()
+            if not any(marker in err_lower for marker in _DELETED_REPLY_TARGET_MARKERS):
+                raise
+            logger.info("Reply target was deleted (%s); falling back to send_message", exc)
+
+    chat_id = chat.id if chat is not None else context.bot_data.get("admin_user_id")
+    if chat_id is not None and getattr(context, "bot", None) is not None:
+        await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+
+async def _handle_missing_reminder(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    alert_text: str = "This reminder was deleted or no longer exists.",
+) -> None:
+    """Recover gracefully when a callback references a deleted or missing reminder."""
+    await _safe_answer(query, alert_text, show_alert=True)
+    await _safe_edit_message(
+        query,
+        "ℹ️ <b>Reminder No Longer Exists</b>\n\n"
+        "That reminder was deleted or is no longer available.\n"
+        "Use the Admin Control Panel below to continue.",
+        reply_markup=build_main_menu_keyboard(),
+        context=context,
+    )
+
+
+def _is_bot_reminder_post(post_text: str) -> bool:
+    """Return True if text matches the bot's own channel reminder format to avoid self-loops."""
+    return "Event ending " in post_text and "Event link:-" in post_text
 
 
 def _format_days_left_label(days_left: int) -> str:
@@ -571,10 +656,20 @@ async def enforce_admin_access(
     if update.channel_post is not None or update.edited_channel_post is not None:
         return
 
-    if getattr(update, "my_chat_member", None) is not None or getattr(
-        update, "chat_member", None
-    ) is not None:
-        raise ApplicationHandlerStop
+    # Ignore non-interactive Telegram service/lifecycle updates (e.g. deletions, reactions, boosts)
+    for service_attr in (
+        "my_chat_member",
+        "chat_member",
+        "deleted_business_messages",
+        "message_reaction",
+        "message_reaction_count",
+        "chat_boost",
+        "removed_chat_boost",
+        "poll",
+        "poll_answer",
+    ):
+        if getattr(update, service_attr, None) is not None:
+            raise ApplicationHandlerStop
 
     if _is_private_admin(update, context):
         return
@@ -616,7 +711,11 @@ async def _process_channel_post(
     *,
     is_edit: bool = False,
 ) -> None:
-    """Core pipeline: verify channel -> cache -> Gemini parse -> save pending -> notify admin."""
+    """Core pipeline: verify channel -> cache -> Gemini decision -> save pending -> notify admin."""
+    if getattr(post, "chat", None) is None or getattr(post, "message_id", None) is None:
+        logger.warning("Ignoring malformed channel post missing chat or message_id")
+        return
+
     configured_channel = context.bot_data["channel_id"]
     resolved_channel_id = context.bot_data.get("resolved_channel_id")
     resolved_channel_username = context.bot_data.get("resolved_channel_username")
@@ -666,10 +765,15 @@ async def _process_channel_post(
         logger.info("Channel post %s/%d has no text or caption; skipping", post.chat.id, post.message_id)
         return
 
+    # Never feed the bot's own reminder postings back into Gemini
+    if _is_bot_reminder_post(post_text):
+        logger.debug("Skipping bot-formatted reminder post %s/%d", post.chat.id, post.message_id)
+        return
+
     db = _get_db(context)
     post_link = build_post_link(post.chat, post.message_id)
 
-    # 1. Cache incoming channel post in Supabase (never abort detection if cache fails)
+    # 1. Cache incoming channel post in Supabase (never abort Gemini decision if cache fails)
     try:
         await db.cache_channel_post(
             channel_id=post.chat.id,
@@ -688,7 +792,8 @@ async def _process_channel_post(
             dedupe_key=f"cache_err:{post.message_id}",
         )
 
-    # 2. Avoid duplicate reminders (for edits, skip if ANY reminder already exists for this post)
+    # 2. Avoid duplicate reminders for the exact same post (on transient DB error, alert & still continue)
+    already_tracked = False
     try:
         if is_edit:
             already_tracked = await db.has_any_reminder_for_post(
@@ -711,13 +816,12 @@ async def _process_channel_post(
             context_info=f"Checking existing reminders for {post_link}",
             dedupe_key=f"dup_check_err:{post.message_id}",
         )
-        return
 
     if already_tracked:
-        logger.debug("Post %s/%d already tracked; skipping detection", post.chat.id, post.message_id)
+        logger.debug("Post %s/%d already tracked; skipping duplicate detection", post.chat.id, post.message_id)
         return
 
-    # 3. Extract deadline via Gemini API
+    # 3. Send EVERY qualifying channel post through Gemini API to decide if it has a time period/deadline
     parser = _get_parser(context)
     today = db.today()
 
@@ -738,16 +842,28 @@ async def _process_channel_post(
         )
         return
 
+    reason_line = (
+        f"Gemini decision: {extraction.decision_reason}\n"
+        if getattr(extraction, "decision_reason", None)
+        else ""
+    )
+
     if not (extraction.has_deadline and extraction.end_date):
-        logger.info("No deadline detected in channel post %s/%d", post.chat.id, post.message_id)
+        logger.info(
+            "Gemini decided no reminder time period in channel post %s/%d (reason=%s)",
+            post.chat.id,
+            post.message_id,
+            getattr(extraction, "decision_reason", None),
+        )
         title_hint = f"Detected topic: {extraction.title}\n" if extraction.title else ""
         await _notify_admin_notice(
             context,
-            "Channel Post Seen — No Deadline Detected",
+            "Channel Post Checked — No Reminder Period Found",
             (
-                "The bot received and cached a new channel post, but Gemini did not find "
-                "a clear event end date/deadline.\n"
+                "Gemini inspected the new channel post and decided it does not contain a "
+                "qualifying time period or event deadline.\n"
                 f"{title_hint}"
+                f"{reason_line}"
                 "Tip: Use /admin → Set Reminder Post if you want to schedule a reminder manually."
             ),
             post_link=post_link,
@@ -766,11 +882,12 @@ async def _process_channel_post(
         )
         await _notify_admin_notice(
             context,
-            "Channel Post Seen — Past Deadline Ignored",
+            "Channel Post Checked — Past Deadline Ignored",
             (
                 f"Detected event: {extraction.title or _fallback_title_from_text(post_text)}\n"
                 f"Extracted end date ({extraction.end_date}) is earlier than today "
-                f"({today.isoformat()}), so no reminder confirmation card was created."
+                f"({today.isoformat()}), so no reminder confirmation card was created.\n"
+                f"{reason_line}".rstrip()
             ),
             post_link=post_link,
             dedupe_key=f"past_deadline:{post.message_id}",
@@ -888,12 +1005,13 @@ async def cmd_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     context.user_data.pop("manual_flow", None)
     text = await _render_main_menu_text(context)
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_main_menu_keyboard(),
-        )
+    await _safe_reply(
+        update,
+        context,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_menu_keyboard(),
+    )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -904,23 +1022,25 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     had_flow = context.user_data.pop("manual_flow", None) is not None
     note = "✅ Cancelled manual reminder setup.\n\n" if had_flow else ""
     text = note + await _render_main_menu_text(context)
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_main_menu_keyboard(),
-        )
+    await _safe_reply(
+        update,
+        context,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_menu_keyboard(),
+    )
 
 
 async def cmd_unknown_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Guide the admin when an unrecognized command is entered."""
     if not _is_private_admin(update, context):
         return
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Unknown command. Use /admin (or /start) to open the Admin Control Panel, "
-            "or /cancel to exit an active setup."
-        )
+    await _safe_reply(
+        update,
+        context,
+        "Unknown command. Use /admin (or /start) to open the Admin Control Panel, "
+        "or /cancel to exit an active setup.",
+    )
 
 
 # ======================================================================
@@ -947,12 +1067,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     db = _get_db(context)
     today = db.today()
 
+    async def _edit(text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+        await _safe_edit_message(query, text, reply_markup=reply_markup, context=context)
+
     # --- Main Menu Navigation ---
     if data == "menu:home":
         await _safe_answer(query)
         context.user_data.pop("manual_flow", None)
-        await _safe_edit_message(
-            query,
+        await _edit(
             await _render_main_menu_text(context),
             reply_markup=build_main_menu_keyboard(),
         )
@@ -966,8 +1088,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await _safe_answer(query)
         await db.expire_past_reminders()
         reminders = await db.list_active_reminders()
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_active_list_message(reminders, today),
             reply_markup=build_active_reminders_keyboard(reminders, page=page),
         )
@@ -981,8 +1102,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await _safe_answer(query)
         await db.expire_past_reminders()
         reminders = await db.list_active_reminders()
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_instant_list_message(reminders),
             reply_markup=build_instant_reminder_list_keyboard(reminders, page=page),
         )
@@ -991,8 +1111,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "menu:set_post":
         await _safe_answer(query)
         context.user_data["manual_flow"] = {"step": "awaiting_link"}
-        await _safe_edit_message(
-            query,
+        await _edit(
             "🔗 <b>Set Reminder Post (Manual Link Entry)</b>\n\n"
             "Send the Telegram channel post link you want to track.\n\n"
             "<b>Accepted examples:</b>\n"
@@ -1011,7 +1130,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder no longer exists.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         if reminder.status != "pending":
             await _safe_answer(
@@ -1021,8 +1140,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         await _safe_answer(query)
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_detection_message(reminder, today),
             reply_markup=build_detection_confirm_keyboard(reminder.id),
         )
@@ -1035,7 +1153,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder no longer exists.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         if reminder.status != "pending":
             await _safe_answer(
@@ -1046,8 +1164,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await db.update_reminder_status(reminder_id, "declined")
         await _safe_answer(query, "Reminder declined.")
-        await _safe_edit_message(
-            query,
+        await _edit(
             f"❌ <b>Reminder Declined</b>\n\n"
             f"📌 <b>Title:</b> {html.escape(reminder.title)}\n"
             f"⏳ <b>End Date:</b> {html.escape(reminder.end_date)}\n\n"
@@ -1063,7 +1180,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         if reminder.status != "pending":
             await _safe_answer(
@@ -1074,8 +1191,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await _safe_answer(query)
         duration_text = _format_duration_text(reminder.start_date, reminder.end_date, today)
-        await _safe_edit_message(
-            query,
+        await _edit(
             "🪟 <b>Step 1 of 2 — Select Reminder Window</b>\n\n"
             f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
             f"🗓 <b>Start Date:</b> {html.escape(reminder.start_date or 'N/A')}\n"
@@ -1098,7 +1214,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         if reminder.status != "pending":
             await _safe_answer(
@@ -1109,8 +1225,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await _safe_answer(query)
         suffix = "Day" if window_days == 1 else "Days"
-        await _safe_edit_message(
-            query,
+        await _edit(
             "🔁 <b>Step 2 of 2 — Select Repeat Mode</b>\n\n"
             f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
             f"⏳ <b>End Date:</b> {html.escape(reminder.end_date)}\n"
@@ -1140,7 +1255,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         existing = await db.get_reminder(reminder_id)
         if existing is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         if existing.status != "pending":
             await _safe_answer(
@@ -1157,13 +1272,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             activate=True,
         )
         if updated is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
 
         await _safe_answer(query, "Reminder activated!")
         safe_link = html.escape(updated.post_link, quote=True)
-        await _safe_edit_message(
-            query,
+        await _edit(
             "✅ <b>Reminder Confirmed & Activated</b>\n\n"
             f"📌 <b>Event Title:</b> {html.escape(updated.title)}\n"
             f"🗓 <b>Start Date:</b> {html.escape(updated.start_date or 'N/A')}\n"
@@ -1188,22 +1302,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await _safe_answer(query, "Reminder no longer exists.", show_alert=True)
             reminders = await db.list_active_reminders()
             if source == "active":
-                await _safe_edit_message(
-                    query,
+                await _edit(
                     _format_active_list_message(reminders, today),
                     reply_markup=build_active_reminders_keyboard(reminders, page=0),
                 )
             else:
-                await _safe_edit_message(
-                    query,
+                await _edit(
                     _format_instant_list_message(reminders),
                     reply_markup=build_instant_reminder_list_keyboard(reminders, page=0),
                 )
             return
 
         await _safe_answer(query)
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_overview_message(reminder, today),
             reply_markup=build_overview_keyboard(reminder.id, source=source),
         )
@@ -1217,7 +1328,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
 
         target_channel = _get_channel_id(context)
@@ -1243,8 +1354,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         refreshed = await db.get_reminder(reminder.id) or reminder
         await _safe_answer(query, "🚀 Instant reminder posted to channel!", show_alert=True)
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_overview_message(
                 refreshed,
                 today,
@@ -1263,11 +1373,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         await _safe_answer(query)
-        await _safe_edit_message(
-            query,
+        await _edit(
             "⚙️ <b>Edit Reminder Settings — Step 1 of 2</b>\n\n"
             f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
             f"🪟 <b>Current Window:</b> {html.escape(reminder.window_label)}\n"
@@ -1292,12 +1401,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
         await _safe_answer(query)
         suffix = "Day" if window_days == 1 else "Days"
-        await _safe_edit_message(
-            query,
+        await _edit(
             "⚙️ <b>Edit Reminder Settings — Step 2 of 2</b>\n\n"
             f"📌 <b>Event:</b> {html.escape(reminder.title)}\n"
             f"🪟 <b>New Window:</b> Last {window_days} {suffix}\n\n"
@@ -1333,12 +1441,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             activate=False,
         )
         if updated is None:
-            await _safe_answer(query, "Reminder not found.", show_alert=True)
+            await _handle_missing_reminder(query, context)
             return
 
         await _safe_answer(query, "✅ Reminder settings updated!")
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_overview_message(
                 updated,
                 today,
@@ -1358,11 +1465,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         reminder = await db.get_reminder(reminder_id)
         if reminder is None:
-            await _safe_answer(query, "Reminder already deleted.", show_alert=True)
+            await _handle_missing_reminder(query, context, "Reminder already deleted.")
             return
         await _safe_answer(query)
-        await _safe_edit_message(
-            query,
+        await _edit(
             "⚠️ <b>Confirm Deletion</b>\n\n"
             "Are you sure you want to permanently delete this reminder?\n\n"
             f"📌 <b>Title:</b> {html.escape(reminder.title)}\n"
@@ -1388,14 +1494,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         reminders = await db.list_active_reminders()
         if source == "instant":
-            await _safe_edit_message(
-                query,
+            await _edit(
                 _format_instant_list_message(reminders),
                 reply_markup=build_instant_reminder_list_keyboard(reminders, page=0),
             )
         else:
-            await _safe_edit_message(
-                query,
+            await _edit(
                 _format_active_list_message(reminders, today),
                 reply_markup=build_active_reminders_keyboard(reminders, page=0),
             )
@@ -1405,8 +1509,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "manual:cancel":
         await _safe_answer(query, "Cancelled.")
         context.user_data.pop("manual_flow", None)
-        await _safe_edit_message(
-            query,
+        await _edit(
             await _render_main_menu_text(context),
             reply_markup=build_main_menu_keyboard(),
         )
@@ -1424,8 +1527,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await _safe_answer(query)
         flow["post_text"] = flow.get("post_text") or ""
         flow["step"] = "awaiting_end_date"
-        await _safe_edit_message(
-            query,
+        await _edit(
             "⏳ <b>Enter Event End Date</b>\n\n"
             "Type the deadline date in any of these accepted formats:\n"
             "• <code>YYYY-MM-DD</code> (e.g. <code>2026-12-31</code>)\n"
@@ -1446,8 +1548,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await _safe_answer(query)
         flow["step"] = "configuring"
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_manual_overview(flow, today) + "\n\n🪟 <b>Select Reminder Window:</b>",
             reply_markup=build_manual_window_keyboard(flow.get("window_days")),
         )
@@ -1469,8 +1570,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await _safe_answer(query)
         flow["window_days"] = window_days
         flow["step"] = "configuring"
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_manual_overview(flow, today)
             + "\n\n🔁 <b>Select Repeat Mode:</b>\n"
             "• <b>Normal (Daily):</b> 1 reminder every day inside the window.\n"
@@ -1495,8 +1595,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await _safe_answer(query)
         flow["repeat_mode"] = repeat_mode
         flow["step"] = "ready_to_confirm"
-        await _safe_edit_message(
-            query,
+        await _edit(
             _format_manual_overview(flow, today)
             + "\n\nReview the details above and click <b>Confirm & Activate</b> to save.",
             reply_markup=build_manual_final_confirm_keyboard(),
@@ -1530,8 +1629,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "An active or pending reminder already exists for this post.",
                 show_alert=True,
             )
-            await _safe_edit_message(
-                query,
+            await _edit(
                 "⚠️ <b>Duplicate Reminder Prevented</b>\n\n"
                 "An open reminder already exists for that Telegram post link.\n"
                 "Manage or edit it from <b>Active Reminders</b>.",
@@ -1566,8 +1664,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         await _safe_answer(query, "✅ Reminder saved and activated!")
         safe_link = html.escape(reminder.post_link, quote=True)
-        await _safe_edit_message(
-            query,
+        await _edit(
             "✅ <b>Manual Reminder Saved & Activated</b>\n\n"
             f"📌 <b>Event Title:</b> {html.escape(reminder.title)}\n"
             f"🗓 <b>Start Date:</b> {html.escape(reminder.start_date or 'N/A')}\n"
@@ -1595,9 +1692,6 @@ async def _run_manual_gemini_and_advance(
     post_text: str,
 ) -> None:
     """Analyze text with Gemini during manual flow and advance to fallback or overview."""
-    message = update.effective_message
-    assert message is not None
-
     db = _get_db(context)
     parser = _get_parser(context)
     today = db.today()
@@ -1632,7 +1726,9 @@ async def _run_manual_gemini_and_advance(
             if flow.get("title")
             else ""
         )
-        await message.reply_text(
+        await _safe_reply(
+            update,
+            context,
             "⚠️ <b>Could not automatically detect an upcoming End Date</b>\n\n"
             f"{detected_title_note}"
             "Please type the <b>End Date</b> directly using one of these formats:\n"
@@ -1646,7 +1742,9 @@ async def _run_manual_gemini_and_advance(
 
     if not flow.get("title"):
         flow["step"] = "awaiting_title"
-        await message.reply_text(
+        await _safe_reply(
+            update,
+            context,
             f"⏳ <b>Detected End Date:</b> <code>{html.escape(flow['end_date'])}</code>\n\n"
             "No concise title could be extracted. Please type the <b>Event Title</b>:",
             parse_mode=ParseMode.HTML,
@@ -1655,7 +1753,9 @@ async def _run_manual_gemini_and_advance(
         return
 
     flow["step"] = "configuring"
-    await message.reply_text(
+    await _safe_reply(
+        update,
+        context,
         _format_manual_overview(flow, today)
         + "\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>",
         parse_mode=ParseMode.HTML,
@@ -1672,7 +1772,11 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     flow: Optional[dict[str, Any]] = context.user_data.get("manual_flow")
     if not flow:
-        await message.reply_text("Use /admin or /start to open the Admin Control Panel.")
+        await _safe_reply(
+            update,
+            context,
+            "Use /admin or /start to open the Admin Control Panel.",
+        )
         return
 
     step = flow.get("step")
@@ -1683,7 +1787,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         raw_text = (message.text or message.caption or "").strip()
         parsed = parse_telegram_post_link(raw_text)
         if parsed is None:
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 "❌ <b>Invalid Telegram post link.</b>\n\n"
                 "Please send a valid channel post URL, for example:\n"
                 "• <code>https://t.me/my_channel/123</code>\n"
@@ -1700,7 +1806,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             post_link=parsed.post_link,
         ):
             context.user_data.pop("manual_flow", None)
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 "⚠️ <b>Reminder Already Exists</b>\n\n"
                 "That post already has an active or pending reminder. "
                 "You can manage or edit it from <b>Active Reminders</b>.",
@@ -1724,14 +1832,18 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
         if cached is not None:
             flow["channel_id"] = cached.channel_id
-            await message.reply_text(
-                "📦 Found this post in the cache! Extracting event details with Gemini..."
+            await _safe_reply(
+                update,
+                context,
+                "📦 Found this post in the cache! Extracting event details with Gemini...",
             )
             await _run_manual_gemini_and_advance(update, context, flow, cached.post_text)
             return
 
         flow["step"] = "awaiting_post_text"
-        await message.reply_text(
+        await _safe_reply(
+            update,
+            context,
             "ℹ️ <b>Post not found in cache</b>\n\n"
             "Because this bot uses the Telegram Bot API (bot token only), it cannot fetch "
             "older channel posts published before the bot saw them.\n\n"
@@ -1746,7 +1858,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if step == "awaiting_post_text":
         post_text = (message.text or message.caption or "").strip()
         if not post_text:
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 "⚠️ That message has no text or caption. Please forward a text/captioned post, "
                 "paste the text, or click <b>Skip & Enter Title/Date Manually</b>.",
                 parse_mode=ParseMode.HTML,
@@ -1771,7 +1885,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 context_info=f"Caching manual post text for {flow.get('post_link')}",
             )
 
-        await message.reply_text("🤖 Analyzing post text with Gemini...")
+        await _safe_reply(update, context, "🤖 Analyzing post text with Gemini...")
         await _run_manual_gemini_and_advance(update, context, flow, post_text)
         return
 
@@ -1779,7 +1893,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         raw_date = (message.text or "").strip()
         parsed_date = parse_user_date(raw_date)
         if parsed_date is None:
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 "❌ <b>Could not parse that date.</b>\n\n"
                 "Please enter the <b>End Date</b> in one of these accepted formats:\n"
                 "• <code>YYYY-MM-DD</code> (e.g. <code>2026-12-31</code>)\n"
@@ -1791,7 +1907,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if parsed_date < today:
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 f"❌ <b>Past date rejected:</b> <code>{parsed_date.isoformat()}</code> is before "
                 f"today (<code>{today.isoformat()}</code>).\n\n"
                 "Please enter today or a future End Date:",
@@ -1804,7 +1922,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
         if not flow.get("title"):
             flow["step"] = "awaiting_title"
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 f"✅ End Date set to <code>{html.escape(flow['end_date'])}</code>.\n\n"
                 "Now please type a concise <b>Event Title</b>:",
                 parse_mode=ParseMode.HTML,
@@ -1813,7 +1933,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         flow["step"] = "configuring"
-        await message.reply_text(
+        await _safe_reply(
+            update,
+            context,
             _format_manual_overview(flow, today)
             + "\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>",
             parse_mode=ParseMode.HTML,
@@ -1825,7 +1947,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if step == "awaiting_title":
         title = " ".join((message.text or "").strip().split())
         if not title:
-            await message.reply_text(
+            await _safe_reply(
+                update,
+                context,
                 "⚠️ Title cannot be empty. Please type a concise <b>Event Title</b>:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_manual_cancel_keyboard(),
@@ -1834,7 +1958,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
         flow["title"] = title[:120]
         flow["step"] = "configuring"
-        await message.reply_text(
+        await _safe_reply(
+            update,
+            context,
             _format_manual_overview(flow, today)
             + "\n\n🪟 <b>Step 1 of 2 — Select Reminder Window:</b>",
             parse_mode=ParseMode.HTML,
@@ -1843,13 +1969,15 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    await message.reply_text(
-        "Please use the inline buttons above to complete your selection, or send /cancel to exit."
+    await _safe_reply(
+        update,
+        context,
+        "Please use the inline buttons above to complete your selection, or send /cancel to exit.",
     )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler that logs AND sends an instant loop-safe alert to ADMIN_USER_ID."""
+    """Global error handler that classifies, logs, and sends an instant loop-safe alert to ADMIN_USER_ID."""
     err = context.error
     logger.exception("Unhandled exception while processing update %s", update, exc_info=err)
     if err is None:
@@ -1870,11 +1998,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         elif update.callback_query is not None:
             update_summary = f"callback_query data={update.callback_query.data!r}"
         elif update.effective_message is not None:
-            update_summary = f"message chat={update.effective_chat.id if update.effective_chat else None}"
+            update_summary = (
+                f"message chat={update.effective_chat.id if update.effective_chat else None}"
+            )
+
+    err_module = (type(err).__module__ or "").lower()
+    if "asyncpg" in err_module or "postgres" in str(err).lower():
+        operation = "Database Error"
+    elif isinstance(err, TelegramError):
+        operation = "Telegram Error"
+    else:
+        operation = "Unhandled Error"
 
     await _notify_admin_error(
         context,
-        "Unhandled Error",
+        operation,
         err,
         context_info=update_summary,
     )

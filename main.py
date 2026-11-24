@@ -247,6 +247,11 @@ def main() -> None:
     application = (
         ApplicationBuilder()
         .token(config.bot_token)
+        .concurrent_updates(True)
+        .connect_timeout(15.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(15.0)
         .post_init(_on_post_init)
         .post_shutdown(_on_post_shutdown)
         .build()
